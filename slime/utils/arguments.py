@@ -230,6 +230,21 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Whether to disable recompute loss function to save memory during training.",
             )
             parser.add_argument(
+                "--graceful-exit-at-unix-time",
+                type=float,
+                default=None,
+                help=(
+                    "After this Unix timestamp, finish the current rollout, save a synchronous checkpoint, "
+                    "and exit successfully."
+                ),
+            )
+            parser.add_argument(
+                "--training-complete-marker",
+                type=str,
+                default=None,
+                help="Atomically write this marker after all configured rollouts finish.",
+            )
+            parser.add_argument(
                 "--log-probs-chunk-size", type=int, default=-1, help="Chunk size to compute log probs to save memory"
             )
             parser.add_argument(
@@ -1822,6 +1837,8 @@ def slime_validate_args(args):
 
     if args.save_interval is not None:
         assert args.save is not None, "'--save' is required when save_interval is set."
+    if args.graceful_exit_at_unix_time is not None:
+        assert args.save is not None, "'--save' is required when graceful exit is enabled."
 
     assert not (args.kl_coef != 0 and args.kl_loss_coef != 0), "Only one of kl_coef and kl_loss_coef can be set"
 

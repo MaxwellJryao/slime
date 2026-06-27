@@ -1,9 +1,15 @@
+import logging
+
 import ray
 
 from slime.ray.placement_group import create_placement_groups, create_rollout_manager, create_training_models
 from slime.utils.arguments import parse_args
 from slime.utils.logging_utils import configure_logger, finish_tracking, init_tracking
 from slime.utils.misc import should_run_periodic_action
+from slime.utils.training_lifecycle import graceful_exit_due, write_training_complete_marker
+
+
+logger = logging.getLogger(__name__)
 
 
 # The framework supports other asynchronous approaches such as fully async (which is shown in examples/full_async).
@@ -27,9 +33,25 @@ def train(args):
     if args.check_weight_update_equal:
         ray.get(rollout_manager.check_weights.remote(action="compare"))
 
+    graceful_exit_deadline = getattr(args, "graceful_exit_at_unix_time", None)
+    training_complete_marker = getattr(args, "training_complete_marker", None)
+    if graceful_exit_deadline is not None:
+        logger.info("Graceful checkpoint deadline is Unix timestamp %.0f", graceful_exit_deadline)
+
     # async train loop.
-    rollout_data_next_future = rollout_manager.generate.remote(args.start_rollout_id)
+    completed_all_rollouts = True
+    exit_before_first_rollout = False
+    rollout_data_next_future = None
+    if args.start_rollout_id < args.num_rollout:
+        if graceful_exit_due(graceful_exit_deadline):
+            completed_all_rollouts = False
+            exit_before_first_rollout = True
+            logger.info("Graceful deadline was reached before the next rollout started")
+        else:
+            rollout_data_next_future = rollout_manager.generate.remote(args.start_rollout_id)
     for rollout_id in range(args.start_rollout_id, args.num_rollout):
+        if exit_before_first_rollout:
+            break
         # Sync the last generation
         if rollout_data_next_future is not None:
             rollout_data_curr_ref = ray.get(rollout_data_next_future)
@@ -48,19 +70,28 @@ def train(args):
         else:
             ray.get(actor_model.async_train(rollout_id, rollout_data_curr_ref))
 
-        if should_run_periodic_action(rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout):
+        graceful_exit = graceful_exit_due(graceful_exit_deadline)
+        save_due = should_run_periodic_action(
+            rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout
+        )
+        if save_due or graceful_exit:
             if (not args.use_critic) or rollout_id >= args.num_critic_only_steps:
                 actor_model.save_model(
                     rollout_id,
-                    force_sync=rollout_id == args.num_rollout - 1,
+                    force_sync=graceful_exit or rollout_id == args.num_rollout - 1,
                 )
             if args.use_critic:
                 critic_model.save_model(
                     rollout_id,
-                    force_sync=rollout_id == args.num_rollout - 1,
+                    force_sync=graceful_exit or rollout_id == args.num_rollout - 1,
                 )
             if args.rollout_global_dataset:
                 ray.get(rollout_manager.save.remote(rollout_id))
+
+        if graceful_exit:
+            completed_all_rollouts = False
+            logger.info("Graceful deadline reached after rollout %s; checkpoint is complete", rollout_id)
+            break
 
         if (rollout_id + 1) % args.update_weights_interval == 0:
             # sync generate before update weights to prevent update weight in the middle of generation
@@ -71,6 +102,8 @@ def train(args):
         if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch):
             ray.get(rollout_manager.eval.remote(rollout_id))
 
+    if completed_all_rollouts:
+        write_training_complete_marker(training_complete_marker, num_rollout=args.num_rollout)
     ray.get(rollout_manager.dispose.remote())
     finish_tracking(args)
 
