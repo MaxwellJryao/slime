@@ -4,7 +4,7 @@ from collections.abc import Callable
 from copy import deepcopy
 
 from slime.utils import logging_utils
-from slime.utils.metric_utils import compute_rollout_step
+from slime.utils.metric_utils import set_wandb_step
 from slime.utils.timer import Timer
 
 logger = logging.getLogger(__name__)
@@ -49,6 +49,5 @@ def log_perf_data_raw(
 
     logger.info(f"perf {rollout_id}: {log_dict}")
 
-    step = compute_rollout_step(args, rollout_id)
-    log_dict["rollout/step"] = step
-    logging_utils.log(args, log_dict, step_key="rollout/step")
+    step_key = set_wandb_step(args, log_dict, rollout_id, default_step_key="rollout/step")
+    logging_utils.log(args, log_dict, step_key=step_key)

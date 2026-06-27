@@ -11,7 +11,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 
 from slime.utils import train_metric_utils
 from slime.utils.flops_utils import calculate_fwd_flops
-from slime.utils.metric_utils import compute_pass_rate, compute_rollout_step
+from slime.utils.metric_utils import compute_pass_rate, set_wandb_step
 from slime.utils.types import RolloutBatch
 
 from ...utils import logging_utils
@@ -191,10 +191,8 @@ def gather_log_data(
         return None
     reduced_log_dict = {f"{metric_name}/{k}": v for k, v in reduced.items()}
     logger.info(f"{metric_name} {rollout_id}: {reduced_log_dict}")
-    # Calculate step once to avoid duplication
-    step = compute_rollout_step(args, rollout_id)
-    reduced_log_dict["rollout/step"] = step
-    logging_utils.log(args, reduced_log_dict, step_key="rollout/step")
+    step_key = set_wandb_step(args, reduced_log_dict, rollout_id, default_step_key="rollout/step")
+    logging_utils.log(args, reduced_log_dict, step_key=step_key)
     return reduced_log_dict
 
 

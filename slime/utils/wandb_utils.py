@@ -57,6 +57,9 @@ def init_wandb_primary(args):
         "name": run_name,
         "config": _compute_config_for_logging(args),
     }
+    if args.wandb_run_id is not None:
+        init_kwargs["id"] = args.wandb_run_id
+        init_kwargs["resume"] = os.environ.get("WANDB_RESUME", "allow")
 
     # Configure settings based on offline/online mode
     if offline:
@@ -73,7 +76,7 @@ def init_wandb_primary(args):
 
     wandb.init(**init_kwargs)
 
-    _init_wandb_common()
+    _init_wandb_common(args)
 
     # Set wandb_run_id in args for easy access throughout the training process
     args.wandb_run_id = wandb.run.id
@@ -161,16 +164,24 @@ def init_wandb_secondary(args, role=None):
 
     wandb.init(**init_kwargs)
 
-    _init_wandb_common()
+    _init_wandb_common(args)
 
 
-def _init_wandb_common():
+def _init_wandb_common(args):
+    rollout_step_metric = (
+        "train/step" if getattr(args, "wandb_always_use_train_step", False) else "rollout/step"
+    )
+    eval_step_metric = (
+        "train/step" if getattr(args, "wandb_always_use_train_step", False) else "eval/step"
+    )
+
     wandb.define_metric("train/step")
     wandb.define_metric("train/*", step_metric="train/step")
     wandb.define_metric("rollout/step")
-    wandb.define_metric("rollout/*", step_metric="rollout/step")
-    wandb.define_metric("multi_turn/*", step_metric="rollout/step")
-    wandb.define_metric("passrate/*", step_metric="rollout/step")
+    wandb.define_metric("rollout/*", step_metric=rollout_step_metric)
+    wandb.define_metric("multi_turn/*", step_metric=rollout_step_metric)
+    wandb.define_metric("passrate/*", step_metric=rollout_step_metric)
+    wandb.define_metric("polar/*", step_metric=rollout_step_metric)
     wandb.define_metric("eval/step")
-    wandb.define_metric("eval/*", step_metric="eval/step")
-    wandb.define_metric("perf/*", step_metric="rollout/step")
+    wandb.define_metric("eval/*", step_metric=eval_step_metric)
+    wandb.define_metric("perf/*", step_metric=rollout_step_metric)

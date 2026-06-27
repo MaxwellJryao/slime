@@ -23,7 +23,7 @@ from slime.utils.dp_schedule import build_dp_schedule
 from slime.utils.health_monitor import RolloutHealthMonitor
 from slime.utils.http_utils import _wrap_ipv6, find_available_port, get_host_info, init_http_client
 from slime.utils.logging_utils import configure_logger, init_tracking
-from slime.utils.metric_utils import compute_pass_rate, compute_rollout_step, compute_statistics, dict_add_prefix
+from slime.utils.metric_utils import compute_pass_rate, compute_statistics, dict_add_prefix, set_wandb_step
 from slime.utils.misc import Box, group_by, load_function
 from slime.utils.types import Sample
 
@@ -35,6 +35,23 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
+
+_DEFAULT_ROLLOUT_BASE_PORT = 15000
+
+
+def _get_rollout_base_port() -> int:
+    raw_port = os.environ.get("SLIME_ROLLOUT_BASE_PORT", str(_DEFAULT_ROLLOUT_BASE_PORT))
+    try:
+        base_port = int(raw_port)
+    except ValueError as exc:
+        raise ValueError(f"SLIME_ROLLOUT_BASE_PORT must be an integer, got {raw_port!r}") from exc
+
+    # Ray commonly occupies 10002-19999 and Linux ephemeral ports normally
+    # begin at 32768. Keep enough headroom for each engine's auxiliary ports.
+    if not 1024 <= base_port <= 32000:
+        raise ValueError(f"SLIME_ROLLOUT_BASE_PORT must be between 1024 and 32000, got {base_port}")
+    return base_port
+
 
 _ROLLOUT_DATA_TENSOR_DTYPES = {
     "tokens": torch.long,
@@ -226,7 +243,7 @@ class ServerGroup:
 
         # Compute base_port from the maximum cursor across all nodes that
         # this group's engines may land on (conservative: just use global max).
-        base_port = max(port_cursors.values()) if port_cursors else 15000
+        base_port = max(port_cursors.values()) if port_cursors else _get_rollout_base_port()
         addr_and_ports, port_cursors = _allocate_rollout_engine_addr_and_ports_normal(
             args=self.args,
             rollout_engines=rollout_engines,
@@ -1281,9 +1298,8 @@ def _log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any]
 
     logger.info(f"eval {rollout_id}: {log_dict}")
 
-    step = compute_rollout_step(args, rollout_id)
-    log_dict["eval/step"] = step
-    logging_utils.log(args, log_dict, step_key="eval/step")
+    step_key = set_wandb_step(args, log_dict, rollout_id, default_step_key="eval/step")
+    logging_utils.log(args, log_dict, step_key=step_key)
 
     return log_dict
 
@@ -1301,9 +1317,8 @@ def _log_rollout_data(rollout_id, args, samples, rollout_extra_metrics, rollout_
     log_dict |= dict_add_prefix(compute_metrics_from_samples(args, samples), "rollout/")
     log_dict |= dict_add_prefix(compute_perf_metrics_from_samples(args, samples, rollout_time), "perf/")
     logger.info(f"perf {rollout_id}: {log_dict}")
-    step = compute_rollout_step(args, rollout_id)
-    log_dict["rollout/step"] = step
-    logging_utils.log(args, log_dict, step_key="rollout/step")
+    step_key = set_wandb_step(args, log_dict, rollout_id, default_step_key="rollout/step")
+    logging_utils.log(args, log_dict, step_key=step_key)
 
 
 def compute_metrics_from_samples(args, samples):

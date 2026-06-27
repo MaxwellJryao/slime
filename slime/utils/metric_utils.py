@@ -121,3 +121,19 @@ def compute_rollout_step(args, rollout_id):
     if args.wandb_always_use_train_step:
         return rollout_id * args.rollout_batch_size * args.n_samples_per_prompt // args.global_batch_size
     return rollout_id
+
+
+def set_wandb_step(
+    args,
+    metrics: dict[str, Any],
+    rollout_id: int,
+    *,
+    default_step_key: str,
+) -> str:
+    """Attach the explicit W&B axis and return the key used for logging."""
+    step = compute_rollout_step(args, rollout_id)
+    metrics[default_step_key] = step
+    if getattr(args, "wandb_always_use_train_step", False):
+        metrics["train/step"] = step
+        return "train/step"
+    return default_step_key
