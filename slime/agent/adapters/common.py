@@ -198,6 +198,7 @@ class BaseAdapter:
         request: web.Request,
         body: dict,
         reply: Reply,
+        turn: TurnRecord,
         in_tok: int,
         out_tok: int,
         stream: bool,
@@ -359,7 +360,7 @@ class BaseAdapter:
             in_tok, out_tok = len(prompt_ids), len(turn.output_ids)
 
             stream = body.get("stream") is True or "text/event-stream" in request.headers.get("Accept", "")
-            return await self._respond(request, body, reply, in_tok, out_tok, stream)
+            return await self._respond(request, body, reply, turn, in_tok, out_tok, stream)
         finally:
             self.inflight.get(sid, set()).discard(task)
 
@@ -486,6 +487,7 @@ async def call_sglang_generate(
         output_ids=output_ids,
         finish_reason=finish,
         output_log_probs=output_log_probs,
+        meta_info=dict(meta),
     )
 
 

@@ -35,6 +35,7 @@ class TurnRecord:
     output_ids: list[int]
     finish_reason: str
     output_log_probs: list[float] = dataclasses.field(default_factory=list)
+    meta_info: dict[str, Any] = dataclasses.field(default_factory=dict)
 
 
 # ===========================================================================

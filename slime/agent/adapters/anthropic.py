@@ -68,7 +68,7 @@ class AnthropicAdapter(BaseAdapter):
             wire=(blocks, stop_reason),
         )
 
-    async def _respond(self, request, body, reply, in_tok, out_tok, stream) -> web.StreamResponse:
+    async def _respond(self, request, body, reply, _turn, in_tok, out_tok, stream) -> web.StreamResponse:
         blocks, stop_reason = reply.wire
         if stream:
             return await _render_stream(request, blocks, stop_reason, in_tok, out_tok)
