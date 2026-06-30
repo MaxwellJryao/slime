@@ -4,11 +4,12 @@ from typing import Any
 
 import aiohttp
 import requests
-import wandb
 from transformers import AutoTokenizer
 
+from slime.utils import logging_utils
 from slime.utils.async_utils import run
 from slime.utils.mask_utils import MultiTurnLossMaskGenerator
+from slime.utils.metric_utils import set_wandb_step
 from slime.utils.types import Sample
 
 __all__ = ["generate_rollout"]
@@ -107,29 +108,22 @@ def log_raw_info(args, all_meta_info, rollout_id):
                     "avg_reward": weighted_reward_sum / total_samples,
                 }
             )
-            if args.use_wandb:
+            if args.use_wandb or args.use_tensorboard:
                 log_dict = {
                     "rollout/no_filter/total_samples": final_meta_info["total_samples"],
                     "rollout/no_filter/avg_reward": final_meta_info["avg_reward"],
                 }
                 try:
-                    step = (
-                        rollout_id
-                        if not args.wandb_always_use_train_step
-                        else rollout_id * args.rollout_batch_size * args.n_samples_per_prompt // args.global_batch_size
+                    step_key = set_wandb_step(
+                        args,
+                        log_dict,
+                        rollout_id,
+                        default_step_key="rollout/step",
                     )
-                    if args.use_wandb:
-                        log_dict["rollout/step"] = step
-                        wandb.log(log_dict)
-
-                    if args.use_tensorboard:
-                        from slime.utils.tensorboard_utils import _TensorboardAdapter
-
-                        tb = _TensorboardAdapter(args)
-                        tb.log(data=log_dict, step=step)
+                    logging_utils.log(args, log_dict, step_key=step_key)
                     print(f"no filter rollout log {rollout_id}: {log_dict}")
                 except Exception as e:
-                    print(f"Failed to log to wandb: {e}")
+                    print(f"Failed to log rollout metrics: {e}")
                     print(f"no filter rollout log {rollout_id}: {final_meta_info}")
             else:
                 print(f"no filter rollout log {rollout_id}: {final_meta_info}")

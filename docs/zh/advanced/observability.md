@@ -1,32 +1,32 @@
 # 观测
 
-slime 的默认观测路径很简单：训练指标继续进 W&B / TensorBoard；SGLang 的高频 Prometheus metrics 不再上传 W&B；request timing 从 SGLang response `meta_info` 写进 sample trace，并在 rollout 结束时聚合成少量 `perf/...` 指标。
+slime 的默认观测路径很简单：训练指标继续进 W&B / TensorBoard；SGLang 的高频 Prometheus metrics 不再上传 W&B；request timing 从 SGLang response `meta_info` 写进 sample trace，并在 rollout 结束时聚合成少量 `timing/...` 指标。吞吐、速率和计数仍使用 `perf/...`。
 
 ## W&B / TensorBoard 里会看到什么
 
-W&B 和 TensorBoard 仍然记录 reward、loss、KL、entropy、eval 等训练指标。额外的 SGLang request timing 会放在 `perf/` 下，例如：
+W&B 和 TensorBoard 仍然记录 reward、loss、KL、entropy、eval 等训练指标。SGLang duration 放在 `timing/` 下，吞吐和计数放在 `perf/` 下，例如：
 
 ```text
-perf/request/e2e_latency/mean
-perf/request/queue_time/median
+timing/request/e2e_latency/mean
+timing/request/queue_time/median
 perf/request/count
 perf/request/profiled_count
 perf/decode/throughput/mean
-perf/prefill/bootstrap_queue_duration/mean
-perf/prefill/bootstrap_duration/mean
-perf/prefill/alloc_wait_duration/mean
-perf/prefill/forward_duration/max
+timing/prefill/bootstrap_queue_duration/mean
+timing/prefill/bootstrap_duration/mean
+timing/prefill/alloc_wait_duration/mean
+timing/prefill/forward_duration/max
 perf/prefill/transfer_speed_gb_s/mean
-perf/decode/prealloc_duration/mean
-perf/decode/bootstrap_duration/mean
-perf/decode/alloc_wait_duration/mean
-perf/decode/transfer_duration/max
-perf/decode/forward_duration/mean
+timing/decode/prealloc_duration/mean
+timing/decode/bootstrap_duration/mean
+timing/decode/alloc_wait_duration/mean
+timing/decode/transfer_duration/max
+timing/decode/forward_duration/mean
 ```
 
 这些指标是每个 rollout step 聚合一次，不是每个 request 上报一次，所以不会像上传完整 Prometheus metrics 那样拖慢 W&B。
 
-不开 PD 时仍然会有通用的 `perf/request/...` 和可用的 `perf/decode/throughput/...`。`perf/prefill/...` 和更细的 `perf/decode/...duration` 只有在 SGLang 返回对应 `pd_*` timing 字段时才会出现。
+不开 PD 时仍然会有通用的 `timing/request/...` 和可用的 `perf/decode/throughput/...`。`timing/prefill/...` 和更细的 `timing/decode/...duration` 只有在 SGLang 返回对应 `pd_*` timing 字段时才会出现。
 
 ## Prometheus metrics 存在哪里
 

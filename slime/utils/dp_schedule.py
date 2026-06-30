@@ -86,6 +86,7 @@ def build_dp_schedule(
     *,
     global_batch_size: int,
     rollout_indices: list[int],
+    trainable_samples: list[bool] | None = None,
 ) -> tuple[list[list[int]], list[list[list[int]]], list[int], list[int]]:
     """Compute the per-rank DP partition and micro-batch schedule.
 
@@ -103,11 +104,15 @@ def build_dp_schedule(
             samples don't fit are dropped.
         rollout_indices: rollout id for each sample (``samples[i].index``).
             Samples sharing the same id are kept together in one step.
+        trainable_samples: Optional per-sample flags derived from loss masks.
+            A rollout is trainable when any of its samples is trainable.
 
     Returns:
         ``(partitions, micro_batch_indices, num_microbatches, global_batch_sizes)``.
-        ``global_batch_sizes[s]`` = rollout count for step s (constant
-        ``global_batch_size`` for every step).
+        ``global_batch_sizes[s]`` = trainable rollout count for step s. This
+        is the constant ``global_batch_size`` when ``trainable_samples`` is
+        omitted. Fully masked placeholders stay scheduled, but do not dilute
+        the loss denominator when these flags are supplied.
     """
     dp_size = train_parallel_config["dp_size"]
     cp_size = train_parallel_config["cp_size"]
@@ -131,6 +136,11 @@ def build_dp_schedule(
     for sample_pos, rid in enumerate(rollout_indices):
         rollout_id_to_samples.setdefault(rid, []).append(sample_pos)
     rollout_ids = list(rollout_id_to_samples.keys())
+    if trainable_samples is not None:
+        assert len(trainable_samples) == len(rollout_indices), (
+            f"trainable_samples ({len(trainable_samples)}) and rollout_indices "
+            f"({len(rollout_indices)}) must have the same length"
+        )
 
     num_steps = len(rollout_ids) // global_batch_size
     assert num_steps >= 1, (
@@ -147,7 +157,17 @@ def build_dp_schedule(
         step_rollouts = rollout_ids[step_i * global_batch_size : (step_i + 1) * global_batch_size]
         sample_indices = [pos for rid in step_rollouts for pos in rollout_id_to_samples[rid]]
         step_lengths = [total_lengths[i] for i in sample_indices]
-        global_batch_sizes.append(global_batch_size)
+        if trainable_samples is None:
+            effective_batch_size = global_batch_size
+        else:
+            effective_batch_size = sum(
+                any(trainable_samples[pos] for pos in rollout_id_to_samples[rid])
+                for rid in step_rollouts
+            )
+            assert effective_batch_size > 0, (
+                f"step {step_i}: all {global_batch_size} scheduled rollouts are fully masked"
+            )
+        global_batch_sizes.append(effective_batch_size)
         assert len(sample_indices) >= dp_size, (
             f"step {step_i}: {len(sample_indices)} samples < dp_size {dp_size}; "
             f"each step needs at least one sample per rank."

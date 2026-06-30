@@ -20,6 +20,8 @@ from megatron.training.arguments import core_transformer_config_from_args
 from slime.utils.megatron_bridge_utils import patch_auto_bridge_hf_config
 from slime.utils.misc import load_function
 
+from .fp32_lm_head import enable_fp32_lm_head
+
 
 # Adapt from https://github.com/volcengine/verl/blob/c3b20575d2bc815fcccd84bddb4c0401fc4b632b/verl/models/llama/megatron/layers/parallel_linear.py#L82
 class LinearForLastLayer(torch.nn.Linear):
@@ -265,8 +267,36 @@ def wrap_model_provider_with_freeze(original_provider, args):
     return wrapped_provider
 
 
+def wrap_model_provider_with_fp32_lm_head(original_provider, args, role):
+    """Install the FP32 actor head before Megatron applies mixed precision/DDP."""
+
+    if not getattr(args, "enable_fp32_lm_head", False) or role != "actor":
+        return original_provider
+
+    def wrapped_provider(pre_process=True, post_process=True, **kwargs):
+        sig = inspect.signature(original_provider)
+        provider_kwargs = {
+            "pre_process": pre_process,
+            "post_process": post_process,
+        }
+        for key in ["vp_stage", "config", "pg_collection"]:
+            if key in sig.parameters:
+                provider_kwargs[key] = kwargs.get(key, None)
+        model = original_provider(**provider_kwargs)
+        if post_process and not enable_fp32_lm_head(model):
+            raise RuntimeError(
+                "--enable-fp32-lm-head was requested on a post-process model "
+                "without an output_layer"
+            )
+        return model
+
+    return wrapped_provider
+
+
 def get_model_provider_func(args, role="actor"):
-    return wrap_model_provider_with_freeze(_get_model_provider_func(args, role), args)
+    provider = _get_model_provider_func(args, role)
+    provider = wrap_model_provider_with_fp32_lm_head(provider, args, role)
+    return wrap_model_provider_with_freeze(provider, args)
 
 
 def freeze_model_params(model: GPTModel, args: argparse.Namespace):

@@ -191,7 +191,13 @@ def gather_log_data(
         return None
     reduced_log_dict = {f"{metric_name}/{k}": v for k, v in reduced.items()}
     logger.info(f"{metric_name} {rollout_id}: {reduced_log_dict}")
-    step_key = set_wandb_step(args, reduced_log_dict, rollout_id, default_step_key="rollout/step")
+    step_key = set_wandb_step(
+        args,
+        reduced_log_dict,
+        rollout_id,
+        default_step_key="rollout/step",
+        completed_train_batch=True,
+    )
     logging_utils.log(args, reduced_log_dict, step_key=step_key)
     return reduced_log_dict
 

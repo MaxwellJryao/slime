@@ -253,6 +253,12 @@ def make_slime_validate_args(**overrides):
         use_tis=False,
         get_mismatch_metrics=False,
         custom_tis_function_path=None,
+        max_train_rollout_logprob_abs_diff=None,
+        loss_type="policy_loss",
+        policy_loss_type="ppo",
+        dppo_divergence_type="tv",
+        dppo_divergence_threshold=0.1,
+        compute_advantages_and_returns=True,
         use_dynamic_batch_size=False,
         max_tokens_per_gpu=None,
         log_probs_max_tokens_per_gpu=None,
@@ -318,6 +324,73 @@ def test_slime_validate_args_preserves_zero_rollout_gpus_under_colocate(monkeypa
     assert args.rollout_num_gpus == 0
     assert args.offload_train is True
     assert args.offload_rollout is True
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("threshold", [0.0, -1.0, float("inf"), float("nan")])
+def test_slime_validate_args_rejects_invalid_logprob_guard_threshold(monkeypatch, threshold):
+    module = load_slime_arguments_module(monkeypatch)
+    args = make_slime_validate_args(max_train_rollout_logprob_abs_diff=threshold)
+
+    with pytest.raises(ValueError, match="finite number greater than zero"):
+        module.slime_validate_args(args)
+
+
+@pytest.mark.unit
+def test_slime_validate_args_restricts_logprob_guard_to_policy_loss(monkeypatch):
+    module = load_slime_arguments_module(monkeypatch)
+    args = make_slime_validate_args(max_train_rollout_logprob_abs_diff=1.0, loss_type="sft_loss")
+
+    with pytest.raises(ValueError, match="requires --loss-type=policy_loss"):
+        module.slime_validate_args(args)
+
+
+@pytest.mark.unit
+def test_slime_validate_args_requires_logprob_forward_for_guard(monkeypatch):
+    module = load_slime_arguments_module(monkeypatch)
+    args = make_slime_validate_args(
+        max_train_rollout_logprob_abs_diff=1.0,
+        compute_advantages_and_returns=False,
+    )
+
+    with pytest.raises(ValueError, match="requires trainer log-probability computation"):
+        module.slime_validate_args(args)
+
+
+@pytest.mark.unit
+def test_dppo_requires_rollout_behavior_logprobs(monkeypatch):
+    module = load_slime_arguments_module(monkeypatch)
+    args = make_slime_validate_args(policy_loss_type="dppo")
+
+    with pytest.raises(ValueError, match="requires --use-rollout-logprobs"):
+        module.slime_validate_args(args)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("threshold", [0.0, -0.1, float("inf"), float("nan")])
+def test_dppo_rejects_invalid_divergence_threshold(monkeypatch, threshold):
+    module = load_slime_arguments_module(monkeypatch)
+    args = make_slime_validate_args(
+        policy_loss_type="dppo",
+        use_rollout_logprobs=True,
+        dppo_divergence_threshold=threshold,
+    )
+
+    with pytest.raises(ValueError, match="finite number greater than zero"):
+        module.slime_validate_args(args)
+
+
+@pytest.mark.unit
+def test_dppo_requires_group_relative_advantages(monkeypatch):
+    module = load_slime_arguments_module(monkeypatch)
+    args = make_slime_validate_args(
+        policy_loss_type="dppo",
+        use_rollout_logprobs=True,
+        advantage_estimator="gspo",
+    )
+
+    with pytest.raises(ValueError, match="requires --advantage-estimator=grpo"):
+        module.slime_validate_args(args)
 
 
 @pytest.mark.unit

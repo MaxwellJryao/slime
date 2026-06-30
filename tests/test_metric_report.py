@@ -17,11 +17,13 @@ end-to-end variants (real torch.distributed) live in
 
 from __future__ import annotations
 
+import sys
+
 # Import the helpers BEFORE the slime imports so the megatron stub lands
 # in sys.modules first. pytest's prepend importmode puts this file's
 # directory (``tests/``) on sys.path, which is what makes the bare-name
 # import work without an ``__init__.py``.
-import _cp_dist_helpers  # noqa: F401
+import _cp_dist_helpers
 import pytest
 import torch
 
@@ -31,6 +33,16 @@ from slime.backends.megatron_utils.cp_utils import (  # noqa: E402
     reduce_train_step_metrics,
     rollout_log_metric_contribution,
 )
+
+# ``cp_utils`` now holds the fake MPU reference it needs. Remove only the
+# helper-owned module entries so later test modules can import real Megatron.
+for _module_name, _fake_module in (
+    ("megatron.core.mpu", _cp_dist_helpers._fake_mpu),
+    ("megatron.core", _cp_dist_helpers._fake_core),
+    ("megatron", _cp_dist_helpers._fake_megatron),
+):
+    if sys.modules.get(_module_name) is _fake_module:
+        sys.modules.pop(_module_name)
 
 
 NUM_GPUS = 0
@@ -203,6 +215,42 @@ def test_rollout_report_matches_train_report_in_single_step(dp_partition):
 
 
 @pytest.mark.unit
+def test_fully_masked_quarter_uses_trainable_rollout_denominator(mock_dp_with_cp_group):
+    """A 25% placeholder fraction must not turn unit OIS/TIS into 0.75.
+
+    ``build_dp_schedule`` separately pins that this layout reports an
+    effective step GBS of 48. This test pins the consumer side: the same
+    denominator restores the per-rollout mean to one, while the old scheduled
+    GBS=64 reproduces the live-run 0.75 symptom.
+    """
+    response_lengths = [1] * 64
+    total_lengths = [2] * 64
+    loss_masks = [torch.ones(1)] * 48 + [torch.zeros(1)] * 16
+    rollout_mask_sums = torch.tensor([1.0] * 48 + [0.0] * 16)
+    unit_ois_or_tis = torch.ones(64)
+    reducer = get_sum_of_sample_mean(
+        total_lengths,
+        response_lengths,
+        loss_masks,
+        rollout_mask_sums,
+    )
+    reducer_sum = reducer(unit_ois_or_tis).item()
+
+    def report(step_gbs: int) -> float:
+        reduced = reduce_train_step_metrics(
+            [{"keys": ["ois"], "values": torch.tensor([0.0, reducer_sum])}],
+            calculate_per_token_loss=False,
+            step_global_batch_size=step_gbs,
+            cp_size=1,
+            dp_with_cp_group=mock_dp_with_cp_group,
+        )
+        return reduced["ois"]
+
+    assert report(64) == pytest.approx(0.75)
+    assert report(48) == pytest.approx(1.0)
+
+
+@pytest.mark.unit
 def test_train_one_step_per_rollout_mean_report_invariant_to_cp(monkeypatch, mock_dp_with_cp_group):
     """End-to-end check of train_one_step's report formula across CP sizes.
 
@@ -217,7 +265,7 @@ def test_train_one_step_per_rollout_mean_report_invariant_to_cp(monkeypatch, moc
     cp_size = 1 vs cp_size = 2 must give the same reported number —
     otherwise wandb metrics would drift the moment a user enables CP.
     """
-    from megatron.core import mpu as _mpu
+    _mpu = _cp_dist_helpers._fake_mpu
 
     total_lengths = [12, 12]
     response_lengths = [8, 8]
@@ -269,7 +317,7 @@ def test_train_one_step_per_token_loss_report_invariant_to_cp(monkeypatch, mock_
     ``cp_factor = cp_size`` multiplier inside ``reduce_train_step_metrics``
     cancels that inflation, so the report stays CP-invariant.
     """
-    from megatron.core import mpu as _mpu
+    _mpu = _cp_dist_helpers._fake_mpu
 
     total_lengths = [12, 12]
     response_lengths = [8, 8]

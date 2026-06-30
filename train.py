@@ -33,7 +33,12 @@ def train(args):
 
     # special case for eval-only
     if args.num_rollout == 0 and args.eval_interval is not None:
-        ray.get(rollout_manager.eval.remote(rollout_id=0))
+        ray.get(
+            rollout_manager.eval.remote(
+                rollout_id=0,
+                completed_train_batch=False,
+            )
+        )
 
     def offload_train(actor_trains_this_step):
         # Each model auto-offloads after train() when offload_train is set,
@@ -62,7 +67,12 @@ def train(args):
     # train loop.
     for rollout_id in range(args.start_rollout_id, args.num_rollout):
         if args.eval_interval is not None and rollout_id == 0 and not args.skip_eval_before_train:
-            ray.get(rollout_manager.eval.remote(rollout_id))
+            ray.get(
+                rollout_manager.eval.remote(
+                    rollout_id,
+                    completed_train_batch=False,
+                )
+            )
 
         rollout_data_ref = ray.get(rollout_manager.generate.remote(rollout_id))
 
@@ -80,13 +90,19 @@ def train(args):
         else:
             ray.get(actor_model.async_train(rollout_id, rollout_data_ref))
 
+        # RolloutManager holds reward/rollout/perf metrics until the actor has
+        # actually consumed the matching batch.  Keep the synchronous trainer
+        # on the same commit boundary as train_async so failed actor batches do
+        # not reach W&B and successful batches are not discarded at dispose.
+        ray.get(rollout_manager.commit_rollout_metrics.remote(rollout_id))
+
         if should_run_periodic_action(rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout):
             save(rollout_id)
 
         offload_train(actor_trains_this_step)
         if args.offload_rollout:
             ray.get(rollout_manager.onload_weights.remote())
-        actor_model.update_weights()
+        actor_model.update_weights(rollout_id=rollout_id)
 
         if args.offload_rollout:
             ray.get(rollout_manager.onload_kv.remote())

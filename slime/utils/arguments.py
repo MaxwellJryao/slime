@@ -2,6 +2,7 @@ import argparse
 import copy
 import json
 import logging
+import math
 import os
 import warnings
 from typing import Any
@@ -225,6 +226,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--enable-fp32-lm-head",
+                action="store_true",
+                default=False,
+                help=(
+                    "Keep the actor output-layer parameters and projection GEMM in FP32. "
+                    "Applied before mixed-precision/DDP/optimizer construction; requires "
+                    "untied embeddings and output weights."
+                ),
+            )
+            parser.add_argument(
                 "--recompute-loss-function",
                 action="store_true",
                 help="Whether to disable recompute loss function to save memory during training.",
@@ -243,6 +254,22 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=str,
                 default=None,
                 help="Atomically write this marker after all configured rollouts finish.",
+            )
+            parser.add_argument(
+                "--final-eval-complete-marker",
+                type=str,
+                default=None,
+                help=(
+                    "Atomically write this marker only after the final post-training evaluation "
+                    "succeeds. A resume from the final checkpoint reruns only that evaluation "
+                    "while the marker is absent."
+                ),
+            )
+            parser.add_argument(
+                "--final-eval-data-sha256",
+                type=str,
+                default=None,
+                help="SHA-256 of the fixed eval input recorded in the final-eval marker.",
             )
             parser.add_argument(
                 "--log-probs-chunk-size", type=int, default=-1, help="Chunk size to compute log probs to save memory"
@@ -797,6 +824,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=False,
                 help="Whether to skip evaluation before training.",
             )
+            parser.add_argument(
+                "--concurrent-pretrain-eval",
+                action="store_true",
+                default=False,
+                help=(
+                    "Run the fixed pre-train evaluation concurrently with the first training rollout. "
+                    "Actor training still waits for both."
+                ),
+            )
 
             # The following keys are used to override the rollout version during eval.
             parser.add_argument("--eval-input-key", type=str, default=None, help="JSON dataset key")
@@ -815,6 +851,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument("--eval-max-prompt-len", type=int, default=None)
             parser.add_argument("--eval-min-new-tokens", type=int, default=None)
             parser.add_argument("--eval-max-context-len", type=int, default=None)
+            parser.add_argument(
+                "--min-eval-samples",
+                type=int,
+                default=None,
+                help=(
+                    "Minimum number of valid eval samples required for each "
+                    "dataset; counts are logged before an insufficient eval fails."
+                ),
+            )
 
             return parser
 
@@ -902,6 +947,30 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "Choose loss type, currently support ppo policy_loss or sft_loss, "
                     "if custom_loss is set, we will use the function path from `--custom-loss-function-path`."
                 ),
+            )
+            parser.add_argument(
+                "--policy-loss-type",
+                type=str,
+                choices=["ppo", "dppo"],
+                default="ppo",
+                help=(
+                    "Policy surrogate used when --loss-type=policy_loss. 'ppo' uses the "
+                    "usual clipped-ratio objective; 'dppo' uses the directional binary-"
+                    "divergence trust region from arXiv:2602.04879."
+                ),
+            )
+            parser.add_argument(
+                "--dppo-divergence-type",
+                type=str,
+                choices=["tv"],
+                default="tv",
+                help="Binary divergence used by DPPO. Slime currently supports binary total variation.",
+            )
+            parser.add_argument(
+                "--dppo-divergence-threshold",
+                type=float,
+                default=0.1,
+                help="Directional DPPO trust-region threshold on the per-token binary divergence.",
             )
             parser.add_argument(
                 "--custom-loss-function-path",
@@ -1010,6 +1079,17 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 action="store_true",
                 default=False,
                 help="Whether to calculate the mismatch metrics.",
+            )
+            parser.add_argument(
+                "--max-train-rollout-logprob-abs-diff",
+                type=float,
+                default=None,
+                help=(
+                    "Optional production fail-fast threshold for the loss-mask-weighted mean absolute "
+                    "difference between trainer-recomputed and rollout-engine log-probabilities. The "
+                    "whole actor group checks it after the log-probability forward and before policy-loss "
+                    "backward. Disabled by default; fully-async policy lag contributes to this value."
+                ),
             )
             parser.add_argument(
                 "--reset-optimizer-states",
@@ -1763,6 +1843,34 @@ def _validate_update_weight_args(args) -> None:
 def slime_validate_args(args):
     args.eval_datasets = _resolve_eval_datasets(args)
 
+    if getattr(args, "policy_loss_type", "ppo") == "dppo":
+        if args.loss_type != "policy_loss":
+            raise ValueError("--policy-loss-type=dppo requires --loss-type=policy_loss")
+        if args.advantage_estimator != "grpo":
+            raise ValueError("--policy-loss-type=dppo currently requires --advantage-estimator=grpo")
+        if not args.use_rollout_logprobs:
+            raise ValueError(
+                "--policy-loss-type=dppo requires --use-rollout-logprobs so the trust region is "
+                "anchored to the behavior policy that generated each token"
+            )
+        if (
+            not math.isfinite(args.dppo_divergence_threshold)
+            or args.dppo_divergence_threshold <= 0
+        ):
+            raise ValueError("--dppo-divergence-threshold must be a finite number greater than zero")
+
+    logprob_guard_threshold = args.max_train_rollout_logprob_abs_diff
+    if logprob_guard_threshold is not None:
+        if not math.isfinite(logprob_guard_threshold) or logprob_guard_threshold <= 0:
+            raise ValueError("--max-train-rollout-logprob-abs-diff must be a finite number greater than zero")
+        if args.loss_type != "policy_loss":
+            raise ValueError("--max-train-rollout-logprob-abs-diff requires --loss-type=policy_loss")
+        if not args.compute_advantages_and_returns:
+            raise ValueError(
+                "--max-train-rollout-logprob-abs-diff requires trainer log-probability computation; "
+                "do not use --disable-compute-advantages-and-returns"
+            )
+
     if args.kl_coef != 0 or args.use_kl_loss:
         if not os.path.exists(args.ref_load):
             raise FileNotFoundError(f"ref_load {args.ref_load} does not exist, please check the path.")
@@ -1837,7 +1945,7 @@ def slime_validate_args(args):
 
     if args.save_interval is not None:
         assert args.save is not None, "'--save' is required when save_interval is set."
-    if args.graceful_exit_at_unix_time is not None:
+    if getattr(args, "graceful_exit_at_unix_time", None) is not None:
         assert args.save is not None, "'--save' is required when graceful exit is enabled."
 
     assert not (args.kl_coef != 0 and args.kl_loss_coef != 0), "Only one of kl_coef and kl_loss_coef can be set"

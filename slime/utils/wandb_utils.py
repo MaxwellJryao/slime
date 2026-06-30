@@ -6,6 +6,33 @@ import wandb
 
 logger = logging.getLogger(__name__)
 
+_DEFAULT_WANDB_FINISH_TIMEOUT_SECONDS = 30.0
+_defined_metric_axes: set[tuple[str, str]] = set()
+
+
+def _wandb_finish_timeout_seconds() -> float:
+    """Keep distributed workers from holding GPU allocations during W&B teardown."""
+    raw = os.environ.get(
+        "WANDB_FINISH_TIMEOUT",
+        str(_DEFAULT_WANDB_FINISH_TIMEOUT_SECONDS),
+    )
+    try:
+        timeout = float(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid WANDB_FINISH_TIMEOUT=%r; using %.0fs",
+            raw,
+            _DEFAULT_WANDB_FINISH_TIMEOUT_SECONDS,
+        )
+        return _DEFAULT_WANDB_FINISH_TIMEOUT_SECONDS
+    if timeout <= 0:
+        logger.warning(
+            "WANDB_FINISH_TIMEOUT must be positive; using %.0fs",
+            _DEFAULT_WANDB_FINISH_TIMEOUT_SECONDS,
+        )
+        return _DEFAULT_WANDB_FINISH_TIMEOUT_SECONDS
+    return timeout
+
 
 def _is_offline_mode(args) -> bool:
     """Detect whether W&B should run in offline mode.
@@ -62,10 +89,18 @@ def init_wandb_primary(args):
         init_kwargs["resume"] = os.environ.get("WANDB_RESUME", "allow")
 
     # Configure settings based on offline/online mode
+    finish_timeout = _wandb_finish_timeout_seconds()
     if offline:
-        init_kwargs["settings"] = wandb.Settings(mode="offline")
+        init_kwargs["settings"] = wandb.Settings(
+            mode="offline",
+            finish_timeout=finish_timeout,
+        )
     else:
-        init_kwargs["settings"] = wandb.Settings(mode="shared", x_primary=True)
+        init_kwargs["settings"] = wandb.Settings(
+            mode="shared",
+            x_primary=True,
+            finish_timeout=finish_timeout,
+        )
 
     # Add custom directory if specified
     if args.wandb_dir:
@@ -139,12 +174,18 @@ def init_wandb_secondary(args, role=None):
 
     # Configure settings based on offline/online mode
     if offline:
-        settings_kwargs = dict(mode="offline")
+        settings_kwargs = dict(
+            mode="offline",
+            console="off",
+            finish_timeout=_wandb_finish_timeout_seconds(),
+        )
     else:
         settings_kwargs = dict(
             mode="shared",
+            console="off",
             x_primary=False,
             x_update_finish_state=False,
+            finish_timeout=_wandb_finish_timeout_seconds(),
         )
 
     init_kwargs = {
@@ -168,20 +209,94 @@ def init_wandb_secondary(args, role=None):
 
 
 def _init_wandb_common(args):
-    rollout_step_metric = (
-        "train/step" if getattr(args, "wandb_always_use_train_step", False) else "rollout/step"
-    )
-    eval_step_metric = (
-        "train/step" if getattr(args, "wandb_always_use_train_step", False) else "eval/step"
-    )
+    # A process may attach to more than one run over its lifetime.  Exact
+    # metric definitions are run-local, so never carry this cache across
+    # ``wandb.init`` calls.
+    _defined_metric_axes.clear()
+
+    rollout_step_metric = "train/step" if getattr(args, "wandb_always_use_train_step", False) else "rollout/step"
+    eval_step_metric = "eval/train_step" if getattr(args, "wandb_always_use_train_step", False) else "eval/step"
 
     wandb.define_metric("train/step")
     wandb.define_metric("train/*", step_metric="train/step")
-    wandb.define_metric("rollout/step")
+    if getattr(args, "wandb_always_use_train_step", False):
+        wandb.define_metric("rollout/step", step_metric="train/step")
+    else:
+        wandb.define_metric("rollout/step")
     wandb.define_metric("rollout/*", step_metric=rollout_step_metric)
     wandb.define_metric("multi_turn/*", step_metric=rollout_step_metric)
     wandb.define_metric("passrate/*", step_metric=rollout_step_metric)
     wandb.define_metric("polar/*", step_metric=rollout_step_metric)
-    wandb.define_metric("eval/step")
+    _define_gpu_sidecar_metric_axes(args)
+    if getattr(args, "wandb_always_use_train_step", False):
+        wandb.define_metric("eval/train_step")
+    else:
+        wandb.define_metric("eval/step")
     wandb.define_metric("eval/*", step_metric=eval_step_metric)
     wandb.define_metric("perf/*", step_metric=rollout_step_metric)
+    wandb.define_metric("timing/*", step_metric=rollout_step_metric)
+    if getattr(args, "wandb_always_use_train_step", False):
+        # Baseline evaluation can finish after later trainer records.  Give
+        # all metrics in that delayed row an isolated axis so its model step 0
+        # cannot make the canonical trainer series move backwards.
+        wandb.define_metric("timing/eval/*", step_metric="eval/train_step")
+
+
+def _define_gpu_sidecar_metric_axes(args) -> None:
+    """Predeclare independent per-node GPU axes on the primary writer.
+
+    Multiple sidecars must not publish the canonical ``train/step`` key into a
+    shared run: their independently sampled rows can arrive out of order and
+    make that canonical series move backwards.  Each node therefore owns one
+    namespaced step metric while retaining the same numeric training step.
+    """
+
+    metric_prefix = os.environ.get("GPU_MONITOR_PREFIX")
+    raw_num_nodes = os.environ.get("SLURM_NNODES")
+    if not metric_prefix or not raw_num_nodes:
+        return
+    try:
+        num_nodes = int(raw_num_nodes)
+    except ValueError:
+        logger.warning("Invalid SLURM_NNODES=%r; GPU metric axes will be sidecar-defined", raw_num_nodes)
+        return
+    if num_nodes <= 0:
+        logger.warning("SLURM_NNODES must be positive; GPU metric axes will be sidecar-defined")
+        return
+
+    explicit_role = os.environ.get("GPU_MONITOR_NODE_ROLE") or None
+    actor_num_nodes = int(getattr(args, "actor_num_nodes", 1))
+    for node_rank in range(num_nodes):
+        if num_nodes == 1:
+            node_prefix = metric_prefix
+        elif explicit_role == "rank":
+            node_prefix = f"{metric_prefix}/node_{node_rank}"
+        else:
+            node_role = explicit_role or (
+                "actor" if node_rank < actor_num_nodes else "rollout"
+            )
+            node_prefix = f"{metric_prefix}/{node_role}_node_{node_rank}"
+        step_metric = f"{node_prefix}/train_step"
+        wandb.define_metric(step_metric)
+        wandb.define_metric(f"{node_prefix}/*", step_metric=step_metric)
+
+
+def define_logged_metric_axes(metrics: dict, *, step_metric: str) -> None:
+    """Bind every concrete user metric to the axis in its own history row.
+
+    Prefix globs keep W&B's generated panels useful before the first value is
+    logged, but exact definitions are deliberately emitted immediately before
+    each metric's first value.  This removes any dependence on nested wildcard
+    matching and prevents a broad ``perf/*`` or ``timing/*`` definition from
+    choosing the wrong axis when those namespaces are produced by both trainer
+    and rollout processes.
+    """
+
+    for metric_name in metrics:
+        if metric_name == step_metric or metric_name.startswith("_"):
+            continue
+        cache_key = (metric_name, step_metric)
+        if cache_key in _defined_metric_axes:
+            continue
+        wandb.define_metric(metric_name, step_metric=step_metric)
+        _defined_metric_axes.add(cache_key)

@@ -3,6 +3,7 @@ import gc
 import logging
 import math
 import os
+from time import perf_counter, time_ns
 from argparse import Namespace
 from collections.abc import Callable, Sequence
 from contextlib import contextmanager, nullcontext
@@ -30,10 +31,17 @@ except ImportError:
     from megatron.core.utils import unwrap_model
 from slime.utils import logging_utils
 from slime.utils.memory_utils import clear_memory
+from slime.utils.startup_timing import (
+    elapsed_seconds_from_env,
+    record_train_phase_duration,
+)
+from slime.utils.timer import Timer
+from slime.utils.train_progress import atomic_write_train_step
 
 from .checkpoint import load_checkpoint, save_checkpoint
 from .cp_utils import reduce_train_step_metrics
 from .data import DataIterator, get_batch
+from .fp32_lm_head import assert_fp32_lm_head, fp32_lm_head_weight_dtypes
 from .loss import ROLLOUT_TOP_P_TOKEN_KEYS, get_rollout_top_p_logprob_kwargs, loss_function
 from .model_provider import get_model_provider_func
 from .stateless_adam import StatelessAdam
@@ -42,11 +50,7 @@ logger = logging.getLogger(__name__)
 
 
 def _disable_tqdm_for_non_main_rank() -> bool:
-    return not (
-        mpu.get_data_parallel_rank(with_context_parallel=True) == 0
-        and mpu.get_tensor_model_parallel_rank() == 0
-        and mpu.get_pipeline_model_parallel_rank() == mpu.get_pipeline_model_parallel_world_size() - 1
-    )
+    return not (mpu.get_data_parallel_rank(with_context_parallel=True) == 0 and mpu.get_tensor_model_parallel_rank() == 0 and mpu.get_pipeline_model_parallel_rank() == mpu.get_pipeline_model_parallel_world_size() - 1)
 
 
 def _should_update_microbatch_pbar(model) -> bool:
@@ -141,11 +145,7 @@ def _critic_output_layer_needs_reinit(args: Namespace, model: Sequence[DDP], rol
 
             param_name = f"output_layer.{name}"
             ckpt_tensor_metadata = next(
-                (
-                    tensor_metadata
-                    for key, tensor_metadata in checkpoint_metadata.items()
-                    if key == param_name or key.endswith(f".{param_name}")
-                ),
+                (tensor_metadata for key, tensor_metadata in checkpoint_metadata.items() if key == param_name or key.endswith(f".{param_name}")),
                 None,
             )
             expected_shape = tuple(param.shape)
@@ -153,11 +153,7 @@ def _critic_output_layer_needs_reinit(args: Namespace, model: Sequence[DDP], rol
             if checkpoint_shape == expected_shape:
                 continue
 
-            reason = (
-                "missing from checkpoint metadata"
-                if checkpoint_shape is None
-                else f"shape mismatch checkpoint={checkpoint_shape} runtime={expected_shape}"
-            )
+            reason = "missing from checkpoint metadata" if checkpoint_shape is None else f"shape mismatch checkpoint={checkpoint_shape} runtime={expected_shape}"
             logger.warning(
                 "Will reinitialize critic %s after checkpoint load because it is %s",
                 param_name,
@@ -292,6 +288,12 @@ def setup_model_and_optimizer(
     assert args.load is not None or args.pretrained_checkpoint is not None
 
     model = get_model(get_model_provider_func(args, role), ModelType.encoder_or_decoder)
+    if getattr(args, "enable_fp32_lm_head", False) and role == "actor":
+        assert_fp32_lm_head(model)
+        logger.info(
+            "Enabled true FP32 actor LM head before optimizer construction; dtypes=%s",
+            fp32_lm_head_weight_dtypes(model),
+        )
 
     # Optimizer
     kwargs = {}
@@ -391,9 +393,7 @@ def forward_only(
     if use_rollout_top_p_replay:
         batch_keys = _with_rollout_top_p_token_keys(args, batch_keys)
 
-    def forward_step(
-        data_iterator: DataIterator, model: GPTModel, return_schedule_plan: bool = False
-    ) -> tuple[torch.Tensor, Callable[[torch.Tensor], dict[str, list[torch.Tensor]]]]:
+    def forward_step(data_iterator: DataIterator, model: GPTModel, return_schedule_plan: bool = False) -> tuple[torch.Tensor, Callable[[torch.Tensor], dict[str, list[torch.Tensor]]]]:
         """Forward step used by Megatron's pipeline engine.
 
         Args:
@@ -557,7 +557,9 @@ def train_one_step(
         custom_before_train_step_hook = load_function(args.custom_megatron_before_train_step_hook_path)
         custom_before_train_step_hook(args, rollout_id, step_id, model, optimizer, opt_param_scheduler)
 
-    def forward_step(data_iterator: DataIterator, model: GPTModel, return_schedule_plan: bool = False) -> tuple[
+    def forward_step(
+        data_iterator: DataIterator, model: GPTModel, return_schedule_plan: bool = False
+    ) -> tuple[
         torch.Tensor,
         Callable[[torch.Tensor], tuple[torch.Tensor, int, dict[str, torch.Tensor | list[str]]]],
     ]:
@@ -637,7 +639,20 @@ def train_one_step(
 
         return output_tensor, partial(loss_function, args, batch, num_microbatches, step_global_batch_size)
 
-    # Forward pass.
+    # Megatron executes forward and backward as one interleaved pipeline
+    # schedule, so report the fused phase instead of inventing two numbers.
+    # Host dispatch spans are always available and add no GPU barrier. Exact
+    # current-stream CUDA timing is opt-in because synchronizing every optimizer
+    # step can itself reduce the overlap/utilization this telemetry is meant to
+    # diagnose.
+    profile_cuda_phases = torch.cuda.is_available() and os.environ.get("SLIME_PROFILE_CUDA_PHASES", "0").strip().lower() in {"1", "true", "yes", "on"}
+    forward_backward_started_at = perf_counter()
+    if profile_cuda_phases:
+        forward_backward_start = torch.cuda.Event(enable_timing=True)
+        forward_backward_end = torch.cuda.Event(enable_timing=True)
+        optimizer_start = torch.cuda.Event(enable_timing=True)
+        optimizer_end = torch.cuda.Event(enable_timing=True)
+        forward_backward_start.record()
     forward_backward_func = get_forward_backward_func()
     losses_reduced = forward_backward_func(
         forward_step_func=_wrap_forward_step_with_microbatch_pbar(forward_step, microbatch_pbar),
@@ -649,7 +664,18 @@ def train_one_step(
         decoder_seq_length=args.decoder_seq_length,
         forward_only=False,
     )
+    record_train_phase_duration(
+        "train_forward_backward_dispatch",
+        forward_backward_started_at,
+    )
+    if profile_cuda_phases:
+        forward_backward_end.record()
+        optimizer_start.record()
+    optimizer_started_at = perf_counter()
 
+    # Gradient finalization, overflow/grad-norm checks, the parameter update,
+    # scheduler update, and gradient release form the optimizer phase.  This
+    # complements (and is contained by) the existing actor_train timer.
     valid_step = True
     grad_norm = float("nan")
     if not getattr(args, "check_for_nan_in_loss_and_grad", True):
@@ -683,6 +709,19 @@ def train_one_step(
     for model_chunk in model:
         model_chunk.zero_grad_buffer()
     optimizer.zero_grad()
+
+    record_train_phase_duration("optimizer_dispatch", optimizer_started_at)
+    if profile_cuda_phases:
+        optimizer_end.record()
+        optimizer_end.synchronize()
+        Timer().add(
+            "train_forward_backward_cuda",
+            forward_backward_start.elapsed_time(forward_backward_end) / 1000.0,
+        )
+        Timer().add(
+            "optimizer_cuda",
+            optimizer_start.elapsed_time(optimizer_end) / 1000.0,
+        )
 
     if mpu.is_pipeline_last_stage(ignore_virtual=True):
         loss_reduced = reduce_train_step_metrics(
@@ -731,10 +770,7 @@ def train(
     """
     args = get_args()
 
-    assert len(num_microbatches) == len(global_batch_sizes), (
-        f"num_microbatches and global_batch_sizes must have the same length, "
-        f"got {len(num_microbatches)} vs {len(global_batch_sizes)}"
-    )
+    assert len(num_microbatches) == len(global_batch_sizes), f"num_microbatches and global_batch_sizes must have the same length, got {len(num_microbatches)} vs {len(global_batch_sizes)}"
 
     for iterator in data_iterator:
         iterator.reset()
@@ -748,10 +784,7 @@ def train(
     config.grad_scale_func = optimizer.scale_loss
     config.timers = None
     if isinstance(model[0], DDP) and args.overlap_grad_reduce:
-        assert config.no_sync_func is None, (
-            "When overlap_grad_reduce is True, config.no_sync_func must be None; "
-            "a custom no_sync_func is not supported when overlapping grad-reduce"
-        )
+        assert config.no_sync_func is None, "When overlap_grad_reduce is True, config.no_sync_func must be None; a custom no_sync_func is not supported when overlapping grad-reduce"
         config.no_sync_func = [model_chunk.no_sync for model_chunk in model]
         if len(model) == 1:
             config.no_sync_func = config.no_sync_func[0]
@@ -768,11 +801,7 @@ def train(
     pre_hook_enabled = False
 
     if args.reset_optimizer_states:
-        if (
-            mpu.get_data_parallel_rank(with_context_parallel=True) == 0
-            and mpu.get_tensor_model_parallel_rank() == 0
-            and mpu.get_pipeline_model_parallel_rank() == mpu.get_pipeline_model_parallel_world_size() - 1
-        ):
+        if mpu.get_data_parallel_rank(with_context_parallel=True) == 0 and mpu.get_tensor_model_parallel_rank() == 0 and mpu.get_pipeline_model_parallel_rank() == mpu.get_pipeline_model_parallel_world_size() - 1:
             logger.info("Reset optimizer states")
         for chained_optimizer in optimizer.chained_optimizers:
             for group in chained_optimizer.optimizer.param_groups:
@@ -819,7 +848,6 @@ def train(
 
     # Run training iterations till done.
     for step_id in range(num_steps_per_rollout):
-
         # Run training step.
         loss_dict, grad_norm = train_one_step(
             args,
@@ -865,18 +893,11 @@ def train(
                     check_mtp_loss(mtp_losses)
 
         # per train step log.
-        if (
-            mpu.get_data_parallel_rank(with_context_parallel=True) == 0
-            and mpu.get_tensor_model_parallel_rank() == 0
-            and mpu.get_pipeline_model_parallel_rank() == mpu.get_pipeline_model_parallel_world_size() - 1
-        ):
+        if mpu.get_data_parallel_rank(with_context_parallel=True) == 0 and mpu.get_tensor_model_parallel_rank() == 0 and mpu.get_pipeline_model_parallel_rank() == mpu.get_pipeline_model_parallel_world_size() - 1:
             accumulated_step_id = rollout_id * num_steps_per_rollout + step_id
             role = getattr(model[0], "role", "actor")
             role_tag = "" if role == "actor" else f"{role}-"
-            log_dict = {
-                f"train/{role_tag}{key}": val.mean().item() if isinstance(val, torch.Tensor) else val
-                for key, val in loss_dict.items()
-            }
+            log_dict = {f"train/{role_tag}{key}": val.mean().item() if isinstance(val, torch.Tensor) else val for key, val in loss_dict.items()}
             log_dict[f"train/{role_tag}grad_norm"] = grad_norm
             if args.enable_mtp_training:
                 log_dict[f"train/{role_tag}mtp_loss"] = mtp_losses
@@ -887,6 +908,32 @@ def train(
             # Per-step gbs — uneven step sizes are easy to miss without this.
             log_dict[f"train/{role_tag}global_batch_size"] = global_batch_sizes[step_id]
             log_dict["train/step"] = accumulated_step_id
+            if role == "actor":
+                try:
+                    atomic_write_train_step(accumulated_step_id)
+                except OSError:
+                    logger.exception(
+                        "Failed to publish train/step=%d to SLIME_TRAIN_PROGRESS_FILE",
+                        accumulated_step_id,
+                    )
+            if role == "actor" and os.environ.pop("SLIME_TRAINER_FIRST_STEP_PENDING", "") == "1":
+                first_step_finished_unix_ns = time_ns()
+                for metric_name, marker_name in (
+                    (
+                        "timing/startup_trainer_init_to_first_step_time",
+                        "SLIME_TRAINER_INIT_STARTED_UNIX_NS",
+                    ),
+                    (
+                        "timing/startup_job_script_to_first_step_time",
+                        "SLIME_JOB_SCRIPT_START_UNIX_NS",
+                    ),
+                ):
+                    elapsed = elapsed_seconds_from_env(
+                        marker_name,
+                        now_ns=first_step_finished_unix_ns,
+                    )
+                    if elapsed is not None:
+                        log_dict[metric_name] = elapsed
             logging_utils.log(args, log_dict, step_key="train/step")
 
             if args.ci_test and "train/train_rollout_logprob_abs_diff" in log_dict:
@@ -899,11 +946,7 @@ def train(
                 # R3 replays rollout routing for the actor path, while ref
                 # log-probs are computed with normal routing. The initial
                 # actor/ref KL is therefore not expected to be exactly zero.
-                if (
-                    accumulated_step_id == 0
-                    and not getattr(args, "use_rollout_routing_replay", False)
-                    and "train/kl_loss" in log_dict
-                ):
+                if accumulated_step_id == 0 and not getattr(args, "use_rollout_routing_replay", False) and "train/kl_loss" in log_dict:
                     assert log_dict["train/kl_loss"] < 1e-8, f"{log_dict=}"
 
             logger.info(f"{role_tag}step {accumulated_step_id}: {log_dict}")
@@ -965,9 +1008,7 @@ def save(
         enable_forward_pre_hook(model)
 
 
-def initialize_model_and_optimizer(
-    args: Namespace, role: str = "actor"
-) -> tuple[list[DDP], MegatronOptimizer, OptimizerParamScheduler, int]:
+def initialize_model_and_optimizer(args: Namespace, role: str = "actor") -> tuple[list[DDP], MegatronOptimizer, OptimizerParamScheduler, int]:
     """Initialize model(s), optimizer, scheduler, and load from checkpoint.
 
     Args:
@@ -998,6 +1039,11 @@ def initialize_model_and_optimizer(
         checkpointing_context={},
         skip_load_to_model_and_opt=False,
     )
+    if getattr(args, "enable_fp32_lm_head", False) and role == "actor":
+        # Loading BF16 source weights into the FP32 destination is supported,
+        # but the destination Parameter/optimizer/DDP contract must never be
+        # replaced or silently demoted by a checkpoint strategy.
+        assert_fp32_lm_head(model)
     if reinit_critic_output_layer:
         _reinitialize_critic_output_layer(args, model)
         if (args.fp16 or args.bf16) and optimizer is not None:

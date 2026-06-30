@@ -1,10 +1,16 @@
+import logging
 import os
+from time import perf_counter
 
 import ray
 from ray.util.placement_group import PlacementGroup
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from slime.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, add_default_ray_env_vars
+from slime.utils import logging_utils
+from slime.utils.metric_utils import set_wandb_step
+
+logger = logging.getLogger(__name__)
 
 
 class RayTrainGroup:
@@ -75,9 +81,7 @@ class RayTrainGroup:
                 if os.path.exists(dynlib_path):
                     break
             else:
-                raise FileNotFoundError(
-                    "Cannot find torch_memory_saver dynamic library. Please make sure torch_memory_saver is properly installed."
-                )
+                raise FileNotFoundError("Cannot find torch_memory_saver dynamic library. Please make sure torch_memory_saver is properly installed.")
 
             env_vars["LD_PRELOAD"] = dynlib_path
             env_vars["TMS_INIT_ENABLE"] = "1"
@@ -123,10 +127,7 @@ class RayTrainGroup:
         Allocate GPU resourced and initialize model, optimzier, local ckpt, etc.
         """
         self.args = args
-        return [
-            actor.init.remote(args, role, with_ref=with_ref, with_opd_teacher=with_opd_teacher)
-            for actor in self._actor_handlers
-        ]
+        return [actor.init.remote(args, role, with_ref=with_ref, with_opd_teacher=with_opd_teacher) for actor in self._actor_handlers]
 
     def async_train(self, rollout_id, rollout_data_ref, external_data=None):
         """Do one rollout training. Returns a list of Ray refs (one per worker).
@@ -139,22 +140,58 @@ class RayTrainGroup:
         """
         if isinstance(external_data, list):
             assert len(external_data) == len(self._actor_handlers)
-            return [
-                actor.train.remote(rollout_id, rollout_data_ref, external_data=ed)
-                for actor, ed in zip(self._actor_handlers, external_data, strict=False)
-            ]
-        return [
-            actor.train.remote(rollout_id, rollout_data_ref, external_data=external_data)
-            for actor in self._actor_handlers
-        ]
+            return [actor.train.remote(rollout_id, rollout_data_ref, external_data=ed) for actor, ed in zip(self._actor_handlers, external_data, strict=False)]
+        return [actor.train.remote(rollout_id, rollout_data_ref, external_data=external_data) for actor in self._actor_handlers]
 
     def save_model(self, rollout_id, force_sync=False):
-        """Save actor model"""
-        return ray.get([actor.save_model.remote(rollout_id, force_sync=force_sync) for actor in self._actor_handlers])
+        """Save actor model and attribute elapsed time to the producing step."""
+        started = perf_counter()
+        rank_metrics = ray.get([actor.save_model.remote(rollout_id, force_sync=force_sync) for actor in self._actor_handlers])
+        metrics = {"timing/save_model_time": perf_counter() - started}
+        for candidate in rank_metrics:
+            if candidate:
+                metrics.update(candidate)
+                break
+        step_key = set_wandb_step(
+            self.args,
+            metrics,
+            rollout_id,
+            default_step_key="rollout/step",
+            completed_train_batch=True,
+        )
+        logging_utils.log(self.args, metrics, step_key=step_key)
+        return rank_metrics
 
-    def update_weights(self):
-        """Broadcast weights from rank 0 to all other ranks."""
-        return ray.get([actor.update_weights.remote() for actor in self._actor_handlers])
+    def update_weights(self, rollout_id: int | None = None):
+        """Broadcast weights and attribute its end-to-end time to this rollout.
+
+        ``rollout_id=None`` is the initial model seed before any optimizer
+        step.  It is intentionally measured only in logs and not attached to
+        train/step 0.  Later syncs are logged immediately at the final optimizer
+        step that produced the weights, rather than leaking into the next
+        rollout's timer flush.
+        """
+        started = perf_counter()
+        rank_metrics = ray.get([actor.update_weights.remote() for actor in self._actor_handlers])
+        elapsed = perf_counter() - started
+
+        if rollout_id is None:
+            logger.info("Initial actor-to-rollout weight sync completed in %.3fs", elapsed)
+        else:
+            metrics: dict[str, float] = {"timing/update_weights_time": elapsed}
+            for candidate in rank_metrics:
+                if candidate:
+                    metrics.update(candidate)
+                    break
+            step_key = set_wandb_step(
+                self.args,
+                metrics,
+                rollout_id,
+                default_step_key="rollout/step",
+                completed_train_batch=True,
+            )
+            logging_utils.log(self.args, metrics, step_key=step_key)
+        return rank_metrics
 
     def onload(self):
         return ray.get([actor.wake_up.remote() for actor in self._actor_handlers])

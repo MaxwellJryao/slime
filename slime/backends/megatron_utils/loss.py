@@ -14,6 +14,7 @@ from slime.utils.ppo_utils import (
     calculate_log_probs_and_entropy,
     compute_approx_kl,
     compute_cispo_loss,
+    compute_dppo_loss,
     compute_gspo_kl,
     compute_opsm_mask,
     compute_policy_loss,
@@ -475,6 +476,7 @@ def get_log_probs_and_entropy(
     total_lengths: list[int],
     response_lengths: list[int],
     with_entropy: bool = False,
+    entropy_requires_grad: bool = True,
     non_loss_data: bool = True,
     top_p_token_ids: list[list[int]] | None = None,
     top_p_token_offsets: list[list[int]] | None = None,
@@ -529,6 +531,7 @@ def get_log_probs_and_entropy(
         with_entropy=with_entropy,
         chunk_size=chunk_size,
         log_prob_keep_mask=top_p_keep_mask,
+        entropy_requires_grad=entropy_requires_grad,
     )
     log_prob_full = log_prob_full.squeeze(-1)  # [T, 1] -> [T]
 
@@ -917,6 +920,7 @@ def policy_loss_function(
         total_lengths=total_lengths,
         response_lengths=response_lengths,
         with_entropy=True,
+        entropy_requires_grad=(args.entropy_coef != 0.0),
         **get_rollout_top_p_logprob_kwargs(args, batch),
     )
 
@@ -971,7 +975,18 @@ def policy_loss_function(
         log_probs = torch.cat(log_probs, dim=0)
         ppo_kl = old_log_probs - log_probs
 
-    if args.advantage_estimator == "cispo":
+    dppo_divergence = None
+    if getattr(args, "policy_loss_type", "ppo") == "dppo":
+        response_mask = torch.cat(batch["loss_masks"], dim=0).bool()
+        pg_loss, pg_clipfrac, dppo_divergence = compute_dppo_loss(
+            behavior_log_probs=old_log_probs,
+            policy_log_probs=log_probs,
+            advantages=advantages,
+            response_mask=response_mask,
+            divergence_type=args.dppo_divergence_type,
+            divergence_threshold=args.dppo_divergence_threshold,
+        )
+    elif args.advantage_estimator == "cispo":
         pg_loss, pg_clipfrac = compute_cispo_loss(ppo_kl, log_probs, advantages, args.eps_clip, args.eps_clip_high)
     else:
         pg_loss, pg_clipfrac = compute_policy_loss(ppo_kl, advantages, args.eps_clip, args.eps_clip_high)
@@ -1078,6 +1093,9 @@ def policy_loss_function(
         "pg_clipfrac": pg_clipfrac.clone().detach(),
         "ppo_kl": ppo_kl.clone().detach(),
     }
+
+    if dppo_divergence is not None:
+        reported_loss["dppo_binary_tv"] = sum_of_sample_mean(dppo_divergence).clone().detach()
 
     if train_rollout_logprob_abs_diff is not None:
         reported_loss["train_rollout_logprob_abs_diff"] = train_rollout_logprob_abs_diff.clone().detach()

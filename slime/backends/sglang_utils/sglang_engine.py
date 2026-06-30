@@ -1,6 +1,7 @@
 import dataclasses
 import ipaddress
 import logging
+import math
 import multiprocessing
 import os
 import time
@@ -18,6 +19,55 @@ from slime.ray.ray_actor import RayActor
 from slime.utils.http_utils import get_host_info
 
 logger = logging.getLogger(__name__)
+
+_DEFAULT_SGLANG_STARTUP_TIMEOUT_SECONDS = 1800.0
+_SGLANG_STARTUP_TIMEOUT_ENV = "SLIME_SGLANG_STARTUP_TIMEOUT_SECONDS"
+_SGLANG_HEALTH_REQUEST_TIMEOUT_SECONDS = 10.0
+_SGLANG_HEALTH_POLL_INTERVAL_SECONDS = 2.0
+
+
+def _sglang_startup_timeout_seconds() -> float:
+    """Return the bounded server startup window, preserving long model loads."""
+    raw = os.environ.get(
+        _SGLANG_STARTUP_TIMEOUT_ENV,
+        str(_DEFAULT_SGLANG_STARTUP_TIMEOUT_SECONDS),
+    )
+    try:
+        timeout = float(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid %s=%r; using %.0fs",
+            _SGLANG_STARTUP_TIMEOUT_ENV,
+            raw,
+            _DEFAULT_SGLANG_STARTUP_TIMEOUT_SECONDS,
+        )
+        return _DEFAULT_SGLANG_STARTUP_TIMEOUT_SECONDS
+
+    if not math.isfinite(timeout) or timeout <= 0:
+        logger.warning(
+            "%s must be positive; using %.0fs",
+            _SGLANG_STARTUP_TIMEOUT_ENV,
+            _DEFAULT_SGLANG_STARTUP_TIMEOUT_SECONDS,
+        )
+        return _DEFAULT_SGLANG_STARTUP_TIMEOUT_SECONDS
+    return timeout
+
+
+def _terminate_failed_server_process(process: multiprocessing.Process) -> None:
+    """Best-effort termination and reap after startup fails."""
+    pid = process.pid
+    if pid is not None:
+        try:
+            kill_process_tree(pid)
+        except Exception:
+            logger.exception("Failed to terminate SGLang process tree rooted at pid=%s", pid)
+
+    # Reap the multiprocessing child even when kill_process_tree already killed it.
+    process.join(timeout=10)
+    if process.is_alive():
+        logger.warning("SGLang process pid=%s survived process-tree termination; killing it directly", pid)
+        process.kill()
+        process.join(timeout=5)
 
 
 def get_base_gpu_id(args, rank):
@@ -68,34 +118,68 @@ def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
     if getattr(server_args, "node_rank", 0) != 0:
         return p
 
-    _wait_server_healthy(
-        base_url=server_args.url(),
-        api_key=server_args.api_key,
-        is_process_alive=lambda: p.is_alive(),
-    )
+    try:
+        _wait_server_healthy(
+            base_url=server_args.url(),
+            api_key=server_args.api_key,
+            is_process_alive=lambda: p.is_alive(),
+        )
+    except BaseException:
+        _terminate_failed_server_process(p)
+        raise
 
     return p
 
 
-def _wait_server_healthy(base_url, api_key, is_process_alive):
+def _wait_server_healthy(
+    base_url,
+    api_key,
+    is_process_alive,
+    *,
+    startup_timeout_seconds=None,
+    health_request_timeout_seconds=_SGLANG_HEALTH_REQUEST_TIMEOUT_SECONDS,
+    poll_interval_seconds=_SGLANG_HEALTH_POLL_INTERVAL_SECONDS,
+):
+    startup_timeout_seconds = (
+        _sglang_startup_timeout_seconds() if startup_timeout_seconds is None else startup_timeout_seconds
+    )
+    if not math.isfinite(startup_timeout_seconds) or startup_timeout_seconds <= 0:
+        raise ValueError("startup_timeout_seconds must be finite and positive")
+
     headers = {
         "Content-Type": "application/json; charset=utf-8",
         "Authorization": f"Bearer {api_key}",
     }
+    started_at = time.monotonic()
+    deadline = started_at + startup_timeout_seconds
 
     with requests.Session() as session:
         while True:
+            remaining_seconds = deadline - time.monotonic()
+            if remaining_seconds <= 0:
+                raise TimeoutError(
+                    f"SGLang server at {base_url} did not become healthy within "
+                    f"{startup_timeout_seconds:g}s."
+                )
+
             try:
-                response = session.get(f"{base_url}/health_generate", headers=headers)
+                response = session.get(
+                    f"{base_url}/health_generate",
+                    headers=headers,
+                    timeout=min(health_request_timeout_seconds, remaining_seconds),
+                )
                 if response.status_code == 200:
-                    break
+                    return
             except requests.RequestException:
                 pass
 
             if not is_process_alive():
-                raise Exception("Server process terminated unexpectedly.")
+                raise RuntimeError(f"SGLang server process for {base_url} terminated unexpectedly.")
 
-            time.sleep(2)
+            remaining_seconds = deadline - time.monotonic()
+            if remaining_seconds <= 0:
+                continue
+            time.sleep(min(poll_interval_seconds, remaining_seconds))
 
 
 class SGLangEngine(RayActor):

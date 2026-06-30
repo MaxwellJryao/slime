@@ -1,32 +1,32 @@
 # Observability
 
-slime's default observability path is intentionally small: training metrics still go to W&B / TensorBoard; high-frequency SGLang Prometheus metrics are no longer uploaded to W&B; request timings from SGLang response `meta_info` are stored in sample traces and aggregated once per rollout step as compact `perf/...` metrics.
+slime's default observability path is intentionally small: training metrics still go to W&B / TensorBoard; high-frequency SGLang Prometheus metrics are no longer uploaded to W&B; request timings from SGLang response `meta_info` are stored in sample traces and aggregated once per rollout step as compact `timing/...` metrics. Throughput, rates, and counters remain under `perf/...`.
 
 ## W&B / TensorBoard Metrics
 
-W&B and TensorBoard still receive reward, loss, KL, entropy, eval, and other training metrics. SGLang request timing summaries are logged under `perf/`, for example:
+W&B and TensorBoard still receive reward, loss, KL, entropy, eval, and other training metrics. SGLang duration summaries are logged under `timing/`, while throughput and counters use `perf/`, for example:
 
 ```text
-perf/request/e2e_latency/mean
-perf/request/queue_time/median
+timing/request/e2e_latency/mean
+timing/request/queue_time/median
 perf/request/count
 perf/request/profiled_count
 perf/decode/throughput/mean
-perf/prefill/bootstrap_queue_duration/mean
-perf/prefill/bootstrap_duration/mean
-perf/prefill/alloc_wait_duration/mean
-perf/prefill/forward_duration/max
+timing/prefill/bootstrap_queue_duration/mean
+timing/prefill/bootstrap_duration/mean
+timing/prefill/alloc_wait_duration/mean
+timing/prefill/forward_duration/max
 perf/prefill/transfer_speed_gb_s/mean
-perf/decode/prealloc_duration/mean
-perf/decode/bootstrap_duration/mean
-perf/decode/alloc_wait_duration/mean
-perf/decode/transfer_duration/max
-perf/decode/forward_duration/mean
+timing/decode/prealloc_duration/mean
+timing/decode/bootstrap_duration/mean
+timing/decode/alloc_wait_duration/mean
+timing/decode/transfer_duration/max
+timing/decode/forward_duration/mean
 ```
 
 These metrics are aggregated once per rollout step, not emitted once per request, so they should not slow W&B like uploading raw Prometheus metrics would.
 
-Without PD, common `perf/request/...` metrics and available `perf/decode/throughput/...` metrics still exist. Detailed `perf/prefill/...` and `perf/decode/...duration` metrics only appear when SGLang returns the corresponding `pd_*` timing fields.
+Without PD, common `timing/request/...` metrics and available `perf/decode/throughput/...` metrics still exist. Detailed `timing/prefill/...` and `timing/decode/...duration` metrics only appear when SGLang returns the corresponding `pd_*` timing fields.
 
 ## Where Prometheus Data Is Stored
 

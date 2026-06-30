@@ -149,7 +149,30 @@ def allocate_train_group(args, num_nodes, num_gpus_per_node, pg, role="actor", a
     )
 
 
-def create_training_models(args, pgs, rollout_manager, actor_cls=None):
+def connect_training_models_to_rollout(
+    args,
+    actor_model,
+    critic_model,
+    rollout_manager,
+):
+    """Wire initialized trainers to rollout state after both sides are ready."""
+
+    actor_model.set_rollout_manager(rollout_manager)
+    if args.use_critic:
+        critic_model.set_rollout_manager(rollout_manager)
+
+    if args.rollout_global_dataset:
+        ray.get(rollout_manager.load.remote(args.start_rollout_id - 1))
+
+
+def create_training_models(
+    args,
+    pgs,
+    rollout_manager,
+    actor_cls=None,
+    *,
+    connect_rollout_manager: bool = True,
+):
     actor_args = args
     if args.megatron_config_path is not None:
         from slime.utils.arguments import parse_megatron_role_args
@@ -207,18 +230,28 @@ def create_training_models(args, pgs, rollout_manager, actor_cls=None):
     if args.start_rollout_id is None:
         args.start_rollout_id = start_rollout_ids[0]
 
-    actor_model.set_rollout_manager(rollout_manager)
-    if args.use_critic:
-        critic_model.set_rollout_manager(rollout_manager)
-
-    if args.rollout_global_dataset:
-        ray.get(rollout_manager.load.remote(args.start_rollout_id - 1))
+    if connect_rollout_manager:
+        connect_training_models_to_rollout(
+            args,
+            actor_model,
+            critic_model,
+            rollout_manager,
+        )
 
     return actor_model, critic_model
 
 
-def create_rollout_manager(args, pg):
+def create_rollout_manager(args, pg, *, wait_ready: bool = True):
     from .rollout import RolloutManager
+
+    if not wait_ready and (
+        getattr(args, "check_weight_update_equal", False)
+        or getattr(args, "offload_rollout", False)
+    ):
+        raise ValueError(
+            "wait_ready=False cannot be combined with check_weight_update_equal "
+            "or offload_rollout; those startup operations require a ready engine set"
+        )
 
     rollout_manager_options = {
         "num_cpus": 1,
@@ -236,11 +269,17 @@ def create_rollout_manager(args, pg):
         args.num_rollout = num_rollout_per_epoch * args.num_epoch
         assert args.num_rollout > 0
 
-    if args.check_weight_update_equal:
+    if wait_ready:
+        # Do not rely on get_num_rollout_per_epoch as an accidental constructor
+        # barrier: callers with an explicit --num-rollout need the same
+        # guarantee that every SGLang engine is healthy and registered.
+        args.rollout_startup_metrics = ray.get(rollout_manager.ready.remote())
+
+    if getattr(args, "check_weight_update_equal", False):
         ray.get(rollout_manager.check_weights.remote(action="snapshot"))
         ray.get(rollout_manager.check_weights.remote(action="reset_tensors"))
 
-    if args.offload_rollout:
+    if getattr(args, "offload_rollout", False):
         ray.get(rollout_manager.offload.remote())
 
     return rollout_manager, num_rollout_per_epoch

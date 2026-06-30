@@ -322,5 +322,31 @@ def test_rejects_when_fewer_rollouts_than_gbs():
         build_dp_schedule(args, tp, [3] * 6, global_batch_size=4, rollout_indices=[0, 0, 1, 1, 2, 2])
 
 
+@pytest.mark.unit
+def test_fully_masked_rollouts_do_not_dilute_effective_batch_size():
+    """Placeholders stay scheduled but are excluded from loss normalization."""
+    args = make_args(use_dynamic_batch_size=True, max_tokens_per_gpu=100)
+    tp = make_tp(dp_size=2)
+    rollout_indices = list(range(7)) + [7, 7]
+    trainable_samples = [True] * 5 + [False] * 3 + [True]
+
+    partitions, mbi, nmb, gbs_per_step = build_dp_schedule(
+        args,
+        tp,
+        [3] * len(rollout_indices),
+        global_batch_size=4,
+        rollout_indices=rollout_indices,
+        trainable_samples=trainable_samples,
+    )
+
+    # Step 0 has four real rollouts. Step 1 keeps two placeholders in the
+    # schedule but normalizes by two real rollouts. Rollout 7 proves that a
+    # multi-sample rollout is trainable when any sibling is trainable.
+    assert gbs_per_step == [4, 2]
+    assert sum(len(partition) for partition in partitions) == 9
+    assert nmb == [1, 1]
+    assert all(len(rank_mbi) == 2 for rank_mbi in mbi)
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))

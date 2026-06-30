@@ -37,6 +37,11 @@ def _args(**overrides):
         pytest.param({"colocate": True, "rollout_num_gpus": 16}, (16, 0), id="colocate_rollout_equals_actor"),
         pytest.param({"colocate": True, "rollout_num_gpus": 32}, (32, 0), id="colocate_rollout_more_than_actor"),
         pytest.param({"rollout_num_gpus": 0}, (16, 16), id="zero_rollout_gpus"),
+        pytest.param(
+            {"actor_num_nodes": 1, "actor_num_gpus_per_node": 4, "rollout_num_gpus": 28},
+            (32, 4),
+            id="fractional_node_actor_offset",
+        ),
         pytest.param({"colocate": True, "rollout_num_gpus": 0}, (16, 0), id="colocate_zero_rollout_gpus"),
         pytest.param({"rollout_external": True}, (16, 16), id="external"),
         pytest.param({"rollout_external": True, "debug_rollout_only": True}, (0, 0), id="external_debug_rollout"),

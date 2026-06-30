@@ -117,9 +117,17 @@ def has_repetition(text: str):
         return False
 
 
-def compute_rollout_step(args, rollout_id):
+def compute_rollout_step(args, rollout_id, *, completed_train_batch: bool = False):
     if args.wandb_always_use_train_step:
-        return rollout_id * args.rollout_batch_size * args.n_samples_per_prompt // args.global_batch_size
+        num_steps = args.rollout_batch_size * args.n_samples_per_prompt // args.global_batch_size
+        step = rollout_id * num_steps
+        if completed_train_batch:
+            # Rollout-level metrics are committed only after the whole actor
+            # batch succeeds.  When one rollout batch contains multiple
+            # optimizer steps, attach them to the final step rather than the
+            # first (which has not yet consumed the full batch).
+            step += num_steps - 1
+        return step
     return rollout_id
 
 
@@ -129,11 +137,18 @@ def set_wandb_step(
     rollout_id: int,
     *,
     default_step_key: str,
+    completed_train_batch: bool = False,
 ) -> str:
     """Attach the explicit W&B axis and return the key used for logging."""
-    step = compute_rollout_step(args, rollout_id)
+    step = compute_rollout_step(
+        args,
+        rollout_id,
+        completed_train_batch=completed_train_batch,
+    )
     metrics[default_step_key] = step
     if getattr(args, "wandb_always_use_train_step", False):
+        if default_step_key == "eval/train_step":
+            return default_step_key
         metrics["train/step"] = step
         return "train/step"
     return default_step_key

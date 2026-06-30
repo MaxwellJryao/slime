@@ -2,6 +2,7 @@ import abc
 import copy
 import logging
 import os
+import threading
 from pathlib import Path
 
 import torch
@@ -57,6 +58,11 @@ class RolloutDataSource(DataSource):
         self.sample_offset = 0
         # TODO remove this
         self.metadata = {}
+        # Polar's persistent async worker reserves samples on a background
+        # thread while the RolloutManager actor may checkpoint this object.
+        # Serialize cursor mutation and snapshots so every saved state is a
+        # coherent reservation boundary.
+        self._state_lock = threading.RLock()
 
         if args.rollout_global_dataset and args.prompt_data is not None:
             tokenizer = load_tokenizer(args.hf_checkpoint, trust_remote_code=True)
@@ -88,68 +94,60 @@ class RolloutDataSource(DataSource):
             self.dataset = None
 
     def get_samples(self, num_samples):
-        # TODO further improve code
-        if self.dataset is not None:
-            if self.sample_offset + num_samples <= len(self.dataset):
-                prompt_samples = self.dataset.samples[self.sample_offset : self.sample_offset + num_samples]
-                self.sample_offset += num_samples
+        with self._state_lock:
+            # TODO further improve code
+            if self.dataset is not None:
+                if self.sample_offset + num_samples <= len(self.dataset):
+                    prompt_samples = self.dataset.samples[self.sample_offset : self.sample_offset + num_samples]
+                    self.sample_offset += num_samples
+                else:
+                    prompt_samples = self.dataset.samples[self.sample_offset :]
+                    num_samples -= len(prompt_samples)
+                    self.epoch_id += 1
+                    if self.args.rollout_shuffle:
+                        self.dataset.shuffle(self.epoch_id)
+                    prompt_samples += self.dataset.samples[:num_samples]
+                    self.sample_offset = num_samples
             else:
-                prompt_samples = self.dataset.samples[self.sample_offset :]
-                num_samples -= len(prompt_samples)
-                self.epoch_id += 1
-                if self.args.rollout_shuffle:
-                    self.dataset.shuffle(self.epoch_id)
-                prompt_samples += self.dataset.samples[:num_samples]
-                self.sample_offset = num_samples
-        else:
-            prompt_samples = [Sample() for _ in range(num_samples)]
+                prompt_samples = [Sample() for _ in range(num_samples)]
 
-        samples = []
-        for prompt_sample in prompt_samples:
-            group = []
-            for _ in range(self.args.n_samples_per_prompt):
-                sample = copy.deepcopy(prompt_sample)
-                sample.group_index = self.sample_group_index
-                sample.index = self.sample_index
-                self.sample_index += 1
-                group.append(sample)
-            self.sample_group_index += 1
-            samples.append(group)
-        return samples
+            samples = []
+            for prompt_sample in prompt_samples:
+                group = []
+                for _ in range(self.args.n_samples_per_prompt):
+                    sample = copy.deepcopy(prompt_sample)
+                    sample.group_index = self.sample_group_index
+                    sample.index = self.sample_index
+                    self.sample_index += 1
+                    group.append(sample)
+                self.sample_group_index += 1
+                samples.append(group)
+            return samples
 
     def add_samples(self, samples: list[list[Sample]]):
         raise RuntimeError(f"Cannot add samples to {self.__class__.__name__}. This is a read-only data source.")
 
-    def save(self, rollout_id):
-        if not self.args.rollout_global_dataset:
-            return
-
-        state_dict = {
+    def _cursor_state_locked(self) -> dict:
+        """Return the live dataset cursor while ``_state_lock`` is held."""
+        return {
             "sample_offset": self.sample_offset,
             "epoch_id": self.epoch_id,
             "sample_group_index": self.sample_group_index,
             "sample_index": self.sample_index,
-            "metadata": self.metadata,
+            "metadata": copy.deepcopy(self.metadata),
         }
-        path = os.path.join(self.args.save, f"rollout/global_dataset_state_dict_{rollout_id}.pt")
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        torch.save(state_dict, path)
 
-    def load(self, rollout_id=None):
-        if not self.args.rollout_global_dataset:
-            return
+    def _checkpoint_state_locked(self) -> dict:
+        """Return the state to persist while ``_state_lock`` is held.
 
-        if self.args.load is None:
-            return
+        Subclasses with speculative readers may override this without moving
+        the live cursor. The default data source checkpoints its current
+        cursor exactly as before.
+        """
+        return self._cursor_state_locked()
 
-        path = os.path.join(self.args.load, f"rollout/global_dataset_state_dict_{rollout_id}.pt")
-        if not os.path.exists(path):
-            logger.info(f"Checkpoint {path} does not exist.")
-            return
-
-        logger.info(f"load metadata from {path}")
-        logger.info(f"load metadata: {self.metadata}")
-        state_dict = torch.load(path)
+    def _restore_checkpoint_state_locked(self, state_dict: dict) -> None:
+        """Restore a state produced by ``_checkpoint_state_locked``."""
         self.sample_offset = state_dict.get("sample_offset", 0)
         self.epoch_id = state_dict.get("epoch_id", 0)
         self.sample_group_index = state_dict.get("sample_group_index", 0)
@@ -158,6 +156,53 @@ class RolloutDataSource(DataSource):
 
         if self.args.rollout_global_dataset and self.args.rollout_shuffle and self.dataset is not None:
             self.dataset.shuffle(self.epoch_id)
+
+    def save(self, rollout_id):
+        if not self.args.rollout_global_dataset:
+            return
+
+        path = os.path.join(self.args.save, f"rollout/global_dataset_state_dict_{rollout_id}.pt")
+        parent = os.path.dirname(path)
+        os.makedirs(parent, exist_ok=True)
+        tmp_path = f"{path}.tmp.{os.getpid()}.{threading.get_ident()}"
+        try:
+            with self._state_lock:
+                state_dict = self._checkpoint_state_locked()
+                with open(tmp_path, "wb") as f:
+                    torch.save(state_dict, f)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp_path, path)
+                dir_fd = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except FileNotFoundError:
+                pass
+
+    def load(self, rollout_id=None):
+        if not self.args.rollout_global_dataset:
+            return
+
+        if self.args.load is None or rollout_id is None or rollout_id < 0:
+            return
+
+        path = os.path.join(self.args.load, f"rollout/global_dataset_state_dict_{rollout_id}.pt")
+        if not os.path.exists(path):
+            raise FileNotFoundError(
+                f"Training checkpoint iteration {rollout_id} has no exact matching "
+                f"rollout data-source state: {path}"
+            )
+
+        logger.info(f"load metadata from {path}")
+        logger.info(f"load metadata: {self.metadata}")
+        with self._state_lock:
+            state_dict = torch.load(path)
+            self._restore_checkpoint_state_locked(state_dict)
 
     def __len__(self) -> int:
         if self.dataset is None:

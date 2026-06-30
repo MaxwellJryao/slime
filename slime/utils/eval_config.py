@@ -36,7 +36,7 @@ DATASET_RUNTIME_SPECS: dict[str, dict[str, tuple[str, ...]]] = {
     "min_eval_samples": {
         "dataset_keys": ("min_eval_samples",),
         "default_keys": ("min_eval_samples",),
-        "arg_attrs": (),
+        "arg_attrs": ("min_eval_samples",),
     },
 }
 
@@ -234,9 +234,7 @@ def ensure_dataset_list(config: Any) -> list[dict[str, Any]]:
     raise TypeError("eval.datasets must be either a list or a mapping.")
 
 
-def _apply_dataset_field_overrides(
-    args: Any, dataset_cfg: dict[str, Any], defaults: dict[str, Any], spec_names: dict[str, Any]
-) -> None:
+def _apply_dataset_field_overrides(args: Any, dataset_cfg: dict[str, Any], defaults: dict[str, Any], spec_names: dict[str, Any]) -> None:
     for field_name, spec in spec_names.items():
         dataset_value = _pick_from_mapping(dataset_cfg, spec["dataset_keys"])
         default_value = _pick_from_mapping(defaults, spec["default_keys"])

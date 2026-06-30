@@ -148,6 +148,56 @@ def compute_policy_loss(
     return pg_losses, clipfrac
 
 
+def compute_dppo_loss(
+    behavior_log_probs: torch.Tensor,
+    policy_log_probs: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    divergence_threshold: float,
+    divergence_type: str = "tv",
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute the directional DPPO sampled-token surrogate.
+
+    The categorical policy is collapsed into the Bernoulli event
+    ``{sampled token, every other token}``. Binary total variation is then
+    ``abs(exp(behavior_log_prob) - exp(policy_log_prob))``. A token is blocked
+    only when its gradient direction would move an already out-of-region
+    probability farther from the behavior policy; corrective updates remain
+    active.
+
+    Returns per-token ``(loss, blocked, divergence)`` tensors. The caller owns
+    response-token reduction.
+    """
+    if divergence_type != "tv":
+        raise ValueError(f"Unsupported DPPO divergence type: {divergence_type!r}")
+    if divergence_threshold <= 0:
+        raise ValueError("DPPO divergence_threshold must be greater than zero")
+
+    response_mask = response_mask.bool()
+    ratio = torch.exp(policy_log_probs - behavior_log_probs)
+
+    # This is the paper's exact sampled-token binary-TV definition. Valid
+    # categorical log probabilities are <= 0; masked sentinels such as -inf
+    # naturally map to probability zero and are removed below.
+    behavior_prob = torch.exp(behavior_log_probs)
+    policy_prob = torch.exp(policy_log_probs)
+    divergence = torch.where(
+        response_mask,
+        (behavior_prob - policy_prob).abs(),
+        torch.zeros_like(policy_prob),
+    )
+
+    with torch.no_grad():
+        outside_region = divergence > divergence_threshold
+        bad_high = (advantages > 0) & (ratio > 1.0) & outside_region
+        bad_low = (advantages < 0) & (ratio < 1.0) & outside_region
+        blocked = response_mask & (bad_high | bad_low)
+        keep = response_mask & ~blocked
+
+    loss = -ratio * advantages * keep.to(policy_log_probs.dtype)
+    return loss, blocked.to(policy_log_probs.dtype), divergence
+
+
 @torch.compile(dynamic=True)
 def compute_cispo_loss(
     ppo_kl: torch.Tensor,
@@ -690,7 +740,13 @@ def chunked_gae(
 
 
 def calculate_log_probs_and_entropy(
-    logits, tokens, tp_group, with_entropy: bool = False, chunk_size: int = -1, log_prob_keep_mask=None
+    logits,
+    tokens,
+    tp_group,
+    with_entropy: bool = False,
+    chunk_size: int = -1,
+    log_prob_keep_mask=None,
+    entropy_requires_grad: bool = True,
 ):
     logits = logits.contiguous()
     entropy = None
@@ -705,9 +761,14 @@ def calculate_log_probs_and_entropy(
 
             if with_entropy:
                 entropys = []
-                for logits_chunk in logits_chunks:
-                    entropy_input = logits_chunk.clone()
-                    entropys.append(compute_entropy_from_logits(entropy_input, tp_group))
+                if entropy_requires_grad:
+                    for logits_chunk in logits_chunks:
+                        entropy_input = logits_chunk.clone()
+                        entropys.append(compute_entropy_from_logits(entropy_input, tp_group))
+                else:
+                    with torch.no_grad():
+                        for logits_chunk in logits_chunks:
+                            entropys.append(compute_entropy_from_logits(logits_chunk.detach(), tp_group))
                 entropy = torch.cat(entropys, dim=0)
 
             log_probs = []
@@ -717,8 +778,12 @@ def calculate_log_probs_and_entropy(
             log_prob = torch.cat(log_probs, dim=0)
         else:
             if with_entropy:
-                entropy_input = logits.clone()
-                entropy = compute_entropy_from_logits(entropy_input, tp_group)
+                if entropy_requires_grad:
+                    entropy_input = logits.clone()
+                    entropy = compute_entropy_from_logits(entropy_input, tp_group)
+                else:
+                    with torch.no_grad():
+                        entropy = compute_entropy_from_logits(logits.detach(), tp_group)
 
             log_prob = compute_log_probs(logits.clone(), tokens, tp_group, keep_mask=log_prob_keep_mask)
     else:

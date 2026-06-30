@@ -43,17 +43,13 @@ _PROCESSOR_PROMPT_KEYS = {"input_ids", "attention_mask"}
 def _prepare_prompt_ids(sample: Sample, tokenizer, processor: Any) -> list[int]:
     raw_multimodal_inputs = sample.multimodal_inputs or {}
     has_multimodal_inputs = any(value is not None for value in raw_multimodal_inputs.values())
-    reuse_existing_input_ids = bool(sample.tokens) and (
-        sample.multimodal_train_inputs is not None or not has_multimodal_inputs
-    )
+    reuse_existing_input_ids = bool(sample.tokens) and (sample.multimodal_train_inputs is not None or not has_multimodal_inputs)
 
     if processor and has_multimodal_inputs and not reuse_existing_input_ids:
         processor_output = processor(text=sample.prompt, **build_processor_kwargs(raw_multimodal_inputs))
         prompt_ids = processor_output["input_ids"][0]
         if sample.multimodal_train_inputs is None:
-            sample.multimodal_train_inputs = {
-                k: v for k, v in processor_output.items() if k not in _PROCESSOR_PROMPT_KEYS
-            } or None
+            sample.multimodal_train_inputs = {k: v for k, v in processor_output.items() if k not in _PROCESSOR_PROMPT_KEYS} or None
         return prompt_ids
 
     if reuse_existing_input_ids:
@@ -158,15 +154,11 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
     state = GenerateState(args)
     url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
 
-    assert (
-        sample.status == Sample.Status.PENDING or sample.status == Sample.Status.ABORTED
-    ), f"Sample status is {sample.status}"
+    assert sample.status == Sample.Status.PENDING or sample.status == Sample.Status.ABORTED, f"Sample status is {sample.status}"
 
     prompt_ids = _prepare_prompt_ids(sample, state.tokenizer, state.processor)
 
-    assert (
-        sampling_params["max_new_tokens"] >= 0
-    ), f"max_new_tokens: {sampling_params['max_new_tokens']} should not be less than 0"
+    assert sampling_params["max_new_tokens"] >= 0, f"max_new_tokens: {sampling_params['max_new_tokens']} should not be less than 0"
     if sampling_params["max_new_tokens"] == 0:
         sample.status = Sample.Status.TRUNCATED
         return sample
@@ -291,9 +283,7 @@ async def generate_and_rm(
     target="group",
     attrs_getter=lambda args, group, sampling_params, evaluation=False: {"group_size": len(group)},
 )
-async def generate_and_rm_group(
-    args: Namespace, group: list[Sample], sampling_params: dict[str, Any], evaluation: bool = False
-) -> list[Sample] | list[list[Sample]]:
+async def generate_and_rm_group(args: Namespace, group: list[Sample], sampling_params: dict[str, Any], evaluation: bool = False) -> list[Sample] | list[list[Sample]]:
     # ``generate_and_rm`` may return either a ``Sample`` or a ``list[Sample]``
     # depending on whether the ``--custom-generate-function-path`` callable
     # emits one trainable sample or several (e.g. multi-turn agent rollouts
@@ -317,9 +307,7 @@ async def generate_and_rm_group(
         if getattr(args, "sglang_enable_deterministic_inference", False):
             seed = state.group_sampling_seeds[idx]
             current_sampling_params["sampling_seed"] = seed
-        tasks.append(
-            asyncio.create_task(generate_and_rm(args, sample, current_sampling_params, evaluation=evaluation))
-        )
+        tasks.append(asyncio.create_task(generate_and_rm(args, sample, current_sampling_params, evaluation=evaluation)))
 
     group = await asyncio.gather(*tasks)
 
@@ -372,9 +360,7 @@ async def abort(args: Namespace, rollout_id: int) -> list[list[Sample]]:
     return aborted_samples
 
 
-async def generate_rollout_async(
-    args: Namespace, rollout_id: int, data_source: Callable[[int], list[list[Sample]]]
-) -> tuple[RolloutFnTrainOutput, list[list[Sample]]]:
+async def generate_rollout_async(args: Namespace, rollout_id: int, data_source: Callable[[int], list[list[Sample]]]) -> tuple[RolloutFnTrainOutput, list[list[Sample]]]:
     """An example to implement the generate_rollout function for an rule based rm rollout generation.
 
     Args:
@@ -392,9 +378,7 @@ async def generate_rollout_async(
     state = GenerateState(args)
 
     # instantiate data filters
-    dynamic_filter = (
-        load_function(args.dynamic_sampling_filter_path) if args.dynamic_sampling_filter_path is not None else None
-    )
+    dynamic_filter = load_function(args.dynamic_sampling_filter_path) if args.dynamic_sampling_filter_path is not None else None
 
     metric_gatherer = MetricGatherer()
 
@@ -449,9 +433,7 @@ async def generate_rollout_async(
 
     assert len(data) == args.rollout_batch_size, f"Got {len(data)} samples, expected {args.rollout_batch_size}"
     data = sorted(data, key=lambda group: group[0][0].index if isinstance(group[0], list) else group[0].index)
-    all_samples = sorted(
-        all_data, key=lambda group: group[0][0].index if isinstance(group[0], list) else group[0].index
-    )
+    all_samples = sorted(all_data, key=lambda group: group[0][0].index if isinstance(group[0], list) else group[0].index)
 
     # reset the global state to prevent effects on the next rollout or eval.
     state.reset()
@@ -483,9 +465,7 @@ async def eval_rollout(args: Namespace, rollout_id: int) -> tuple[dict[str, dict
     return RolloutFnEvalOutput(data=results), []
 
 
-async def eval_rollout_single_dataset(
-    args: Namespace, rollout_id: int, dataset_cfg: EvalDatasetConfig
-) -> dict[str, dict[str, list[Any]]]:
+async def eval_rollout_single_dataset(args: Namespace, rollout_id: int, dataset_cfg: EvalDatasetConfig) -> dict[str, dict[str, list[Any]]]:
     """An example to implement the eval_rollout function for an rule based rm rollout generation.
 
     Args:
@@ -497,27 +477,15 @@ async def eval_rollout_single_dataset(
 
     global EVAL_PROMPT_DATASET
 
-    eval_multimodal_keys = (
-        dataset_cfg.multimodal_keys if dataset_cfg.multimodal_keys is not None else args.multimodal_keys
-    )
-    eval_apply_chat_template = (
-        dataset_cfg.apply_chat_template if dataset_cfg.apply_chat_template is not None else args.apply_chat_template
-    )
-    eval_apply_chat_template_kwargs = (
-        dataset_cfg.apply_chat_template_kwargs
-        if dataset_cfg.apply_chat_template_kwargs is not None
-        else args.apply_chat_template_kwargs
-    )
+    eval_multimodal_keys = dataset_cfg.multimodal_keys if dataset_cfg.multimodal_keys is not None else args.multimodal_keys
+    eval_apply_chat_template = dataset_cfg.apply_chat_template if dataset_cfg.apply_chat_template is not None else args.apply_chat_template
+    eval_apply_chat_template_kwargs = dataset_cfg.apply_chat_template_kwargs if dataset_cfg.apply_chat_template_kwargs is not None else args.apply_chat_template_kwargs
 
     cache_key = dataset_cfg.cache_key + (
         args.hf_checkpoint,
         eval_apply_chat_template,
         json.dumps(eval_multimodal_keys, sort_keys=True) if eval_multimodal_keys is not None else None,
-        (
-            json.dumps(eval_apply_chat_template_kwargs, sort_keys=True)
-            if eval_apply_chat_template_kwargs is not None
-            else None
-        ),
+        (json.dumps(eval_apply_chat_template_kwargs, sort_keys=True) if eval_apply_chat_template_kwargs is not None else None),
     )
     if cache_key not in EVAL_PROMPT_DATASET:
         tokenizer = load_tokenizer(args.hf_checkpoint, trust_remote_code=True)
@@ -544,11 +512,7 @@ async def eval_rollout_single_dataset(
         max_new_tokens=dataset_cfg.max_response_len,
         stop=args.rollout_stop,
         stop_token_ids=args.rollout_stop_token_ids,
-        skip_special_tokens=(
-            dataset_cfg.skip_special_tokens
-            if dataset_cfg.skip_special_tokens is not None
-            else args.rollout_skip_special_tokens
-        ),
+        skip_special_tokens=(dataset_cfg.skip_special_tokens if dataset_cfg.skip_special_tokens is not None else args.rollout_skip_special_tokens),
         no_stop_trim=dataset_cfg.no_stop_trim if dataset_cfg.no_stop_trim is not None else True,
         spaces_between_special_tokens=False,
     )
@@ -583,17 +547,27 @@ async def eval_rollout_single_dataset(
             )
 
     data = []
+    task_error_count = 0
     do_print = True
     pbar = tqdm(total=len(tasks), desc=f"Eval {dataset_cfg.name}", disable=not do_print)
     for coro in asyncio.as_completed(tasks):
-        sample = await coro
+        try:
+            sample = await coro
+        except Exception:
+            task_error_count += 1
+            logger.exception(
+                "Eval dataset %s sample generation/reward failed; recording reward 0 and continuing",
+                dataset_cfg.name,
+            )
+            pbar.update(1)
+            continue
         if do_print:
             logged_sample = sample[0] if isinstance(sample, list) else sample
-            logged_sample = sample[0] if isinstance(sample, list) else sample
             logger.info(
-                "eval_rollout_single_dataset example data: "
-                f"{[str(logged_sample.prompt) + logged_sample.response]} "
-                f"reward={logged_sample.reward}"
+                "eval_rollout_single_dataset example data: prompt=%r response=%r reward=%r",
+                getattr(logged_sample, "prompt", None),
+                getattr(logged_sample, "response", None),
+                getattr(logged_sample, "reward", None),
             )
             do_print = False
         if isinstance(sample, list):
@@ -606,18 +580,42 @@ async def eval_rollout_single_dataset(
     data.sort(key=lambda sample: sample.index)
 
     reward_key = args.eval_reward_key or args.reward_key
+    rewards = []
+    reward_samples = []
+    reward_error_count = 0
+    for sample in data:
+        try:
+            reward = sample.reward if not reward_key else sample.reward[reward_key]
+            if reward is None:
+                raise ValueError("reward is None")
+        except (KeyError, TypeError, ValueError):
+            reward_error_count += 1
+            logger.warning(
+                "Eval dataset %s sample index=%s has no usable reward; recording reward 0 and continuing",
+                dataset_cfg.name,
+                getattr(sample, "index", None),
+                exc_info=True,
+            )
+            continue
+        rewards.append(reward)
+        reward_samples.append(sample)
+
+    error_count = task_error_count + reward_error_count
     return {
         dataset_cfg.name: {
-            "rewards": [sample.reward if not reward_key else sample.reward[reward_key] for sample in data],
-            "truncated": [sample.status == Sample.Status.TRUNCATED for sample in data],
+            "rewards": rewards,
+            "all_rewards": [*rewards, *([0.0] * error_count)],
+            "truncated": [sample.status == Sample.Status.TRUNCATED for sample in reward_samples],
             "samples": data,
+            "valid_count": len(rewards),
+            "error_count": error_count,
+            "expected_count": len(rewards) + error_count,
+            "min_eval_samples": dataset_cfg.min_eval_samples,
         }
     }
 
 
-def generate_rollout(
-    args: Namespace, rollout_id: int, data_source: Any, evaluation: bool = False
-) -> RolloutFnTrainOutput | RolloutFnEvalOutput:
+def generate_rollout(args: Namespace, rollout_id: int, data_source: Any, evaluation: bool = False) -> RolloutFnTrainOutput | RolloutFnEvalOutput:
     """An example to implement the generate_rollout function for an rule based rm rollout generation.
 
     Args:

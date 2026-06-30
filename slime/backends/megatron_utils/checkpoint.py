@@ -91,7 +91,24 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["save_checkpoint"]
+__all__ = ["is_release_checkpoint", "save_checkpoint"]
+
+
+def is_release_checkpoint(path: str | Path | None) -> bool:
+    """Return whether *path* is a model-only Megatron ``release`` seed.
+
+    Megatron reports a release checkpoint as iteration zero, but it is not a
+    completed RL rollout. Treating that zero as a resumable rollout makes the
+    rollout data source look for ``global_dataset_state_dict_0.pt`` next to a
+    converted base model, where no such training state can exist.
+    """
+    if path is None:
+        return False
+    tracker = Path(path) / "latest_checkpointed_iteration.txt"
+    try:
+        return tracker.read_text(encoding="utf-8").strip() == "release"
+    except (FileNotFoundError, IsADirectoryError, OSError):
+        return False
 
 
 def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_context, skip_load_to_model_and_opt):
