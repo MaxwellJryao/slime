@@ -318,15 +318,15 @@ def make_slime_validate_args(**overrides):
 
 
 @pytest.mark.unit
-def test_min_eval_samples_help_describes_warning_only_semantics(monkeypatch):
+def test_min_eval_samples_help_describes_phase_specific_semantics(monkeypatch):
     module = load_slime_arguments_module(monkeypatch)
     parser = module.argparse.ArgumentParser()
     module.get_slime_extra_args_provider()(parser)
 
     help_text = parser._option_string_actions["--min-eval-samples"].help
-    assert "logged as warnings" in help_text
-    assert "training continues" in help_text
-    assert "fails" not in help_text
+    assert "pre-train, resumed-checkpoint, and periodic evals" in help_text
+    assert "fail final completion" in help_text
+    assert "zero-filled" in help_text
 
 
 @pytest.mark.unit

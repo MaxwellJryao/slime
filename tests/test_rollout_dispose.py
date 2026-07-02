@@ -2,8 +2,42 @@ import threading
 
 import pytest
 
+import train_async
 from slime.ray import rollout as rollout_module
 from slime.ray.rollout import RolloutManager
+
+NUM_GPUS = 0
+
+
+@pytest.mark.parametrize("raw_timeout", ["nan", "inf", "-inf"])
+def test_non_finite_dispose_timeout_uses_default(
+    monkeypatch, caplog, raw_timeout
+):
+    dispose_ref = object()
+    observed_timeouts = []
+
+    class DisposeMethod:
+        def remote(self):
+            return dispose_ref
+
+    class RolloutManagerStub:
+        dispose = DisposeMethod()
+
+    def get_dispose(ref, *, timeout):
+        assert ref is dispose_ref
+        observed_timeouts.append(timeout)
+
+    monkeypatch.setenv("SLIME_DISPOSE_TIMEOUT_SECONDS", raw_timeout)
+    monkeypatch.setattr(train_async.ray, "get", get_dispose)
+
+    with caplog.at_level("WARNING"):
+        train_async._dispose_rollout_manager(RolloutManagerStub())
+
+    assert observed_timeouts == [60.0]
+    assert (
+        f"Invalid SLIME_DISPOSE_TIMEOUT_SECONDS={raw_timeout!r}; using 60s"
+        in caplog.text
+    )
 
 
 def test_rollout_manager_disposes_custom_rollout_before_tracking(monkeypatch):
@@ -81,3 +115,7 @@ def test_pretrain_eval_failure_surfaces_at_weight_sync_barrier():
         manager.wait_pretrain_eval()
     assert manager._pretrain_eval_future is None
     assert manager._pretrain_eval_executor is None
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

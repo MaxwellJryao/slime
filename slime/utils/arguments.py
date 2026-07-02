@@ -260,9 +260,10 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=str,
                 default=None,
                 help=(
-                    "Atomically write this marker only after the final post-training evaluation "
-                    "succeeds. A resume from the final checkpoint reruns only that evaluation "
-                    "while the marker is absent."
+                    "Atomically write this marker only after every final-eval dataset satisfies its "
+                    "completion policy: the configured minimum valid count, or a nonempty error-free "
+                    "result when no minimum is configured. A resume from the final checkpoint reruns "
+                    "only the missing evaluation."
                 ),
             )
             parser.add_argument(
@@ -290,7 +291,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                             --only-train-params-name-list self_attention.wq_b self_attention.wk self_attention.k_norm self_attention.weights_proj
 
                         3. Train ONLY Layer 20 to 23:
-                            --only-train-params-name-list layers\.2[0-3]\.
+                            --only-train-params-name-list layers\\.2[0-3]\\.
                         """,
             )
 
@@ -866,7 +867,9 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=None,
                 help=(
                     "Minimum expected valid-sample count for each dataset; "
-                    "shortfalls are logged as warnings and training continues."
+                    "shortfalls remain warnings in pre-train, resumed-checkpoint, and periodic evals, "
+                    "but fail final completion. Failed samples remain zero-filled and their diagnostic "
+                    "counts are logged even when the configured minimum is met."
                 ),
             )
 

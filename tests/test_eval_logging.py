@@ -7,6 +7,8 @@ from slime.rollout import sglang_rollout
 from slime.utils.eval_config import build_eval_dataset_configs
 from slime.utils.types import Sample
 
+NUM_GPUS = 0
+
 
 def _args() -> SimpleNamespace:
     return SimpleNamespace(
@@ -85,6 +87,105 @@ def test_empty_eval_rewards_are_zero_filled_and_do_not_abort(monkeypatch, caplog
     assert step_key == "eval/train_step"
     assert "continued training" in caplog.text
     assert "errors=2" in caplog.text
+
+
+def test_required_eval_logs_diagnostics_then_raises_even_with_custom_logger(
+    monkeypatch, caplog
+) -> None:
+    custom_calls = []
+    logged = []
+    args = _args()
+    args.custom_eval_rollout_log_function_path = "custom.eval_logger"
+    monkeypatch.setattr(
+        rollout_module,
+        "load_function",
+        lambda _path: lambda *call_args: custom_calls.append(call_args) or True,
+    )
+    monkeypatch.setattr(
+        rollout_module.logging_utils,
+        "log",
+        lambda _args, metrics, *, step_key: logged.append((dict(metrics), step_key)),
+    )
+
+    with caplog.at_level("ERROR"), pytest.raises(
+        RuntimeError, match=r"Required evaluation 4 is incomplete.*errors=2"
+    ):
+        rollout_module._log_eval_rollout_data(
+            rollout_id=4,
+            args=args,
+            data={
+                "holdout": {
+                    "rewards": [],
+                    "all_rewards": [0.0, 0.0],
+                    "valid_count": 0,
+                    "error_count": 2,
+                }
+            },
+            completed_train_batch=True,
+            require_complete=True,
+        )
+
+    assert len(custom_calls) == 1
+    assert len(logged) == 1
+    metrics, step_key = logged[0]
+    assert metrics["eval/holdout/valid_count"] == 0.0
+    assert metrics["eval/holdout/error_count"] == 2.0
+    assert metrics["eval/holdout/reward_mean"] == 0.0
+    assert step_key == "eval/train_step"
+    assert "will not be marked complete" in caplog.text
+
+
+def test_required_eval_rejects_an_empty_dataset_mapping(monkeypatch) -> None:
+    logged = []
+    monkeypatch.setattr(
+        rollout_module.logging_utils,
+        "log",
+        lambda _args, metrics, *, step_key: logged.append((dict(metrics), step_key)),
+    )
+
+    with pytest.raises(RuntimeError, match="no evaluation datasets returned"):
+        rollout_module._log_eval_rollout_data(
+            rollout_id=9,
+            args=_args(),
+            data={},
+            require_complete=True,
+        )
+
+    assert len(logged) == 1
+
+
+def test_required_eval_accepts_errors_at_the_configured_valid_threshold(
+    monkeypatch, caplog
+) -> None:
+    logged = []
+    monkeypatch.setattr(
+        rollout_module.logging_utils,
+        "log",
+        lambda _args, metrics, *, step_key: logged.append(dict(metrics)),
+    )
+
+    with caplog.at_level("WARNING"):
+        result = rollout_module._log_eval_rollout_data(
+            rollout_id=5,
+            args=_args(),
+            data={
+                "holdout": {
+                    "rewards": [1.0, 1.0],
+                    "all_rewards": [1.0, 1.0, 0.0],
+                    "valid_count": 2,
+                    "error_count": 1,
+                    "min_eval_samples": 2,
+                }
+            },
+            require_complete=True,
+        )
+
+    assert result["eval/holdout/reward_mean"] == pytest.approx(2 / 3)
+    assert result["eval/holdout/valid_count"] == 2.0
+    assert result["eval/holdout/error_count"] == 1.0
+    assert result["eval/holdout/min_valid_count"] == 2.0
+    assert len(logged) == 1
+    assert "accepted for final completion" in caplog.text
 
 
 def test_partial_eval_logs_valid_and_error_counts_with_reward(monkeypatch) -> None:
@@ -378,12 +479,24 @@ def test_rollout_manager_eval_returns_logged_payload_for_primary_relay(
         "eval/holdout/reward_mean": 1.0,
         "eval/train_step": 7,
     }
+    observed_kwargs = {}
+
+    def log_eval(*_args, **kwargs):
+        observed_kwargs.update(kwargs)
+        return payload
+
     monkeypatch.setattr(
         rollout_module,
         "_log_eval_rollout_data",
-        lambda *_args, **_kwargs: payload,
+        log_eval,
     )
 
-    result = manager.eval(rollout_id=7)
+    result = manager.eval(rollout_id=7, require_complete=True)
 
     assert result is payload
+    assert observed_kwargs["completed_train_batch"] is True
+    assert observed_kwargs["require_complete"] is True
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

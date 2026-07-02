@@ -5,6 +5,8 @@ import pytest
 import train_async
 from slime.utils.training_lifecycle import write_final_eval_complete_marker
 
+NUM_GPUS = 0
+
 
 class _RemoteMethod:
     def __init__(self, func):
@@ -40,8 +42,11 @@ class _RolloutManager:
             lambda rollout_id: events.append(("state-save", rollout_id))
         )
         self.eval = _RemoteMethod(
-            lambda rollout_id, completed_train_batch=True: (
-                events.append(("eval", rollout_id, completed_train_batch))
+            lambda rollout_id, completed_train_batch=True, require_complete=False: (
+                events.append(
+                    ("eval-require-complete", rollout_id, require_complete)
+                )
+                or events.append(("eval", rollout_id, completed_train_batch))
                 or {
                     "eval/tmax_holdout/reward_mean": 0.5,
                     "eval/train_step": rollout_id + int(completed_train_batch),
@@ -53,6 +58,9 @@ class _RolloutManager:
         )
         self.commit_rollout_metrics = _RemoteMethod(
             lambda rollout_id: events.append(("metrics-commit", rollout_id))
+        )
+        self.check_weights = _RemoteMethod(
+            lambda action: events.append(("check-weights", action))
         )
         self.dispose = _RemoteMethod(lambda: events.append(("dispose", None)))
 
@@ -80,6 +88,7 @@ def test_rollout_state_precedes_training_and_model_commit(monkeypatch, tmp_path)
     args = SimpleNamespace(
         colocate=False,
         check_weight_update_equal=False,
+        offload_rollout=False,
         graceful_exit_at_unix_time=None,
         training_complete_marker=None,
         final_eval_complete_marker=str(tmp_path / "FINAL_EVAL_COMPLETE"),
@@ -109,7 +118,10 @@ def test_rollout_state_precedes_training_and_model_commit(monkeypatch, tmp_path)
     monkeypatch.setattr(
         train_async,
         "create_rollout_manager",
-        lambda _args, _pg, *, wait_ready: (rollout_manager, 1),
+        lambda _args, _pg, *, wait_ready: (
+            events.append(("rollout-manager-wait-ready", wait_ready))
+            or (rollout_manager, 1)
+        ),
     )
     monkeypatch.setattr(
         train_async,
@@ -190,12 +202,15 @@ def test_rollout_state_precedes_training_and_model_commit(monkeypatch, tmp_path)
     assert final_log_index < checked_finish_index
     assert checked_finish_index < names.index("final-eval-marker")
     assert names.index("final-eval-marker") < names.index("training-marker")
+    assert ("eval-require-complete", 0, True) in events
+    assert ("rollout-manager-wait-ready", False) in events
 
 
 def _resume_args(tmp_path, **overrides):
     values = dict(
         colocate=False,
         check_weight_update_equal=False,
+        offload_rollout=False,
         graceful_exit_at_unix_time=None,
         training_complete_marker=str(tmp_path / "TRAINING_COMPLETE"),
         final_eval_complete_marker=str(tmp_path / "FINAL_EVAL_COMPLETE"),
@@ -238,8 +253,8 @@ def _patch_resume_runtime(
         train_async,
         "create_rollout_manager",
         lambda _args, _pg, *, wait_ready: (
-            rollout_manager,
-            num_rollout_per_epoch,
+            events.append(("rollout-manager-wait-ready", wait_ready))
+            or (rollout_manager, num_rollout_per_epoch)
         ),
     )
     monkeypatch.setattr(
@@ -262,6 +277,28 @@ def _patch_resume_runtime(
         lambda _args, *, raise_on_error=False: None,
     )
     monkeypatch.setattr(train_async.ray, "get", lambda value, **_kwargs: value)
+
+
+@pytest.mark.parametrize(
+    "legacy_option",
+    ["check_weight_update_equal", "offload_rollout"],
+)
+def test_legacy_startup_options_wait_for_rollout_readiness(
+    monkeypatch, tmp_path, legacy_option
+):
+    events = []
+    rollout_manager = _RolloutManager(events)
+    args = _resume_args(tmp_path, **{legacy_option: True})
+    _patch_resume_runtime(
+        monkeypatch,
+        events,
+        rollout_manager,
+        _ActorModel(events),
+    )
+
+    train_async.train(args)
+
+    assert ("rollout-manager-wait-ready", True) in events
 
 
 def test_resumed_checkpoint_eval_runs_once_before_first_rollout(
@@ -297,6 +334,10 @@ def test_resumed_checkpoint_eval_runs_once_before_first_rollout(
         ("eval", 39, True),
         ("eval", 49, True),
     ]
+    assert [event for event in events if event[0] == "eval-require-complete"] == [
+        ("eval-require-complete", 39, False),
+        ("eval-require-complete", 49, True),
+    ]
     assert events.index(("weights", None)) < events.index(("eval", 39, True))
     assert events.index(("eval", 39, True)) < events.index(("generate", 40))
     assert events.index(("generate", 40)) < events.index(("train", 40))
@@ -312,7 +353,9 @@ def test_resumed_checkpoint_eval_failure_stops_before_generation(
     events = []
     rollout_manager = _RolloutManager(events)
 
-    def fail_eval(rollout_id, completed_train_batch=True):
+    def fail_eval(
+        rollout_id, completed_train_batch=True, require_complete=False
+    ):
         events.append(("eval", rollout_id, completed_train_batch))
         raise RuntimeError("fixed eval failed")
 
@@ -375,6 +418,7 @@ def test_resumed_checkpoint_without_opt_in_preserves_periodic_eval_only(
     assert [event for event in events if event[0] == "eval"] == [
         ("eval", 49, True)
     ]
+    assert ("eval-require-complete", 49, True) in events
     assert events.index(("generate", 40)) < events.index(("train", 40))
 
 
@@ -403,6 +447,7 @@ def test_final_checkpoint_resume_runs_only_missing_eval(monkeypatch, tmp_path):
 
     assert not [event for event in events if event[0] in {"generate", "train"}]
     assert [event for event in events if event[0] == "eval"] == [("eval", 0, True)]
+    assert ("eval-require-complete", 0, True) in events
     names = [event[0] for event in events]
     assert names.index("eval") < names.index("final-eval-marker")
     assert names.index("final-eval-marker") < names.index("training-marker")
@@ -412,7 +457,10 @@ def test_failed_final_eval_writes_no_completion_marker(monkeypatch, tmp_path):
     events = []
     rollout_manager = _RolloutManager(events)
 
-    def fail_eval(rollout_id, completed_train_batch=True):
+    def fail_eval(
+        rollout_id, completed_train_batch=True, require_complete=False
+    ):
+        assert require_complete is True
         events.append(("eval", rollout_id, completed_train_batch))
         raise RuntimeError("eval failed")
 
@@ -551,6 +599,7 @@ def test_failed_actor_batch_never_commits_prefetched_metrics(monkeypatch):
     args = SimpleNamespace(
         colocate=False,
         check_weight_update_equal=False,
+        offload_rollout=False,
         graceful_exit_at_unix_time=None,
         training_complete_marker=None,
         start_rollout_id=0,
@@ -597,3 +646,7 @@ def test_failed_actor_batch_never_commits_prefetched_metrics(monkeypatch):
         train_async.train(args)
 
     assert ("metrics-commit", 0) not in events
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

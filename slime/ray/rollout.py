@@ -753,7 +753,13 @@ class RolloutManager:
         )
         del self._pending_rollout_logs[rollout_id]
 
-    def eval(self, rollout_id, *, completed_train_batch: bool = True):
+    def eval(
+        self,
+        rollout_id,
+        *,
+        completed_train_batch: bool = True,
+        require_complete: bool = False,
+    ):
         if self.args.debug_train_only:
             # if debug train only, we don't generate evaluation data
             return
@@ -768,6 +774,7 @@ class RolloutManager:
             data,
             result.metrics,
             completed_train_batch=completed_train_batch,
+            require_complete=require_complete,
         )
 
     def save(self, rollout_id):
@@ -1435,14 +1442,21 @@ def _log_eval_rollout_data(
     extra_metrics: dict[str, Any] | None = None,
     *,
     completed_train_batch: bool = True,
+    require_complete: bool = False,
 ):
     if args.custom_eval_rollout_log_function_path is not None:
         custom_log_func = load_function(args.custom_eval_rollout_log_function_path)
-        if custom_log_func(rollout_id, args, data, extra_metrics):
+        custom_log_handled = custom_log_func(rollout_id, args, data, extra_metrics)
+        if custom_log_handled and not require_complete:
             return
+
+        # A strict final eval must still produce the canonical metric payload
+        # and run completeness validation. A custom logger is an additional
+        # publication path, not a way to suppress lifecycle invariants.
 
     log_dict = dict(extra_metrics or {})
     incomplete_datasets: list[str] = []
+    completion_failures: list[str] = []
     for key in data.keys():
         dataset = data[key]
         rewards = list(dataset.get("rewards") or [])
@@ -1477,11 +1491,20 @@ def _log_eval_rollout_data(
             # ``extra_metrics``. Override their valid-only mean so every view
             # of the dataset uses the same zero-filled denominator.
             log_dict[f"eval/{key}/reward_mean"] = reward_mean
+        minimum = "" if min_eval_samples is None else f", required={min_eval_samples}"
+        details = (
+            f"{key} (valid={valid_count}, errors={error_count}, "
+            f"expected={expected_count}{minimum})"
+        )
         if error_count or not expected_count or (min_eval_samples is not None and valid_count < min_eval_samples):
-            minimum = "" if min_eval_samples is None else f", required={min_eval_samples}"
-            incomplete_datasets.append(
-                f"{key} (valid={valid_count}, errors={error_count}, expected={expected_count}{minimum})"
-            )
+            incomplete_datasets.append(details)
+        completion_failed = (
+            valid_count < min_eval_samples
+            if min_eval_samples is not None
+            else not expected_count or error_count > 0
+        )
+        if completion_failed:
+            completion_failures.append(details)
         if samples := dataset.get("samples"):
             log_dict |= dict_add_prefix(compute_metrics_from_samples(args, samples), f"eval/{key}/")
         truncated = list(dataset.get("truncated") or dataset.get("all_truncated") or [])
@@ -1498,6 +1521,10 @@ def _log_eval_rollout_data(
                 f"eval/{key}-",
             )
 
+    if not data:
+        incomplete_datasets.append("no evaluation datasets returned")
+        completion_failures.append("no evaluation datasets returned")
+
     logger.info(f"eval {rollout_id}: {log_dict}")
 
     step_key = set_wandb_step(
@@ -1513,11 +1540,28 @@ def _log_eval_rollout_data(
     )
     logging_utils.log(args, log_dict, step_key=step_key)
 
-    if incomplete_datasets:
-        logger.warning(
-            "Evaluation %s had incomplete dataset(s), counted every missing/error sample as reward 0 and continued training: %s",
+    if require_complete and completion_failures:
+        failure_details = ", ".join(completion_failures)
+        logger.error(
+            "Required evaluation %s did not meet its completion threshold and will not be marked complete: %s",
             rollout_id,
-            ", ".join(incomplete_datasets),
+            failure_details,
+        )
+        raise RuntimeError(
+            f"Required evaluation {rollout_id} is incomplete: {failure_details}"
+        )
+    if incomplete_datasets:
+        diagnostic_details = ", ".join(incomplete_datasets)
+        outcome = (
+            "accepted for final completion because every configured minimum was met"
+            if require_complete
+            else "continued training"
+        )
+        logger.warning(
+            "Evaluation %s had incomplete dataset(s), counted every missing/error sample as reward 0 and %s: %s",
+            rollout_id,
+            outcome,
+            diagnostic_details,
         )
 
     return log_dict

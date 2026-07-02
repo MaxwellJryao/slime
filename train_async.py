@@ -1,4 +1,5 @@
 import logging
+import math
 import os
 import time
 
@@ -60,13 +61,14 @@ def _dispose_rollout_manager(rollout_manager) -> None:
     try:
         timeout = float(raw_timeout)
     except ValueError:
-        timeout = _DEFAULT_DISPOSE_TIMEOUT_SECONDS
+        timeout = None
+
+    if timeout is None or not math.isfinite(timeout) or timeout <= 0:
         logger.warning(
             "Invalid SLIME_DISPOSE_TIMEOUT_SECONDS=%r; using %.0fs",
             raw_timeout,
-            timeout,
+            _DEFAULT_DISPOSE_TIMEOUT_SECONDS,
         )
-    if timeout <= 0:
         timeout = _DEFAULT_DISPOSE_TIMEOUT_SECONDS
 
     dispose_ref = rollout_manager.dispose.remote()
@@ -135,7 +137,9 @@ def train(args):
     rollout_manager, num_rollout_per_epoch = create_rollout_manager(
         args,
         pgs["rollout"],
-        wait_ready=False,
+        wait_ready=bool(
+            args.check_weight_update_equal or args.offload_rollout
+        ),
     )
     # Submit the explicit engine health/router-registration barrier before
     # trainer initialization.  Ray can then load the disjoint rollout and
@@ -296,7 +300,12 @@ def train(args):
             "Final checkpoint %s is loaded but its eval marker is absent; running eval-only recovery",
             final_rollout_id,
         )
-        final_eval_metrics = ray.get(rollout_manager.eval.remote(final_rollout_id))
+        final_eval_metrics = ray.get(
+            rollout_manager.eval.remote(
+                final_rollout_id,
+                require_complete=True,
+            )
+        )
         _relay_final_eval_metrics_to_primary(args, final_eval_metrics)
         write_final_eval_complete_marker(
             final_eval_complete_marker,
@@ -382,7 +391,7 @@ def train(args):
             pretrain_eval_due = False
 
         # Rollout N+1 may already be prefetched, but only batch N has now been
-        # consumed successfully by the actor.  Commit its reward/Polar/perf
+        # consumed successfully by the actor.  Commit its reward/service/perf
         # metrics here so an untrained speculative batch never reaches W&B.
         ray.get(rollout_manager.commit_rollout_metrics.remote(rollout_id))
 
@@ -432,7 +441,12 @@ def train(args):
                 # SGLang may still serve the last periodic sync. Fixed final
                 # eval must observe exactly the checkpointed actor weights.
                 actor_model.update_weights(rollout_id=rollout_id)
-            eval_metrics = ray.get(rollout_manager.eval.remote(rollout_id))
+            eval_metrics = ray.get(
+                rollout_manager.eval.remote(
+                    rollout_id,
+                    require_complete=rollout_id == final_rollout_id,
+                )
+            )
             if require_final_eval_marker and rollout_id == final_rollout_id:
                 _relay_final_eval_metrics_to_primary(args, eval_metrics)
                 write_final_eval_complete_marker(
