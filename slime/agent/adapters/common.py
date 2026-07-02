@@ -399,7 +399,16 @@ def _sampling_params(session: Any, body: dict, *, max_token_keys: tuple[str, ...
             sp["max_new_tokens"] = min(int(sp.get("max_new_tokens", body[key])), int(body[key]))
             break
 
-    for src_k, dst_k in (("temperature", "temperature"), ("top_p", "top_p"), ("top_k", "top_k")):
+    for src_k, dst_k in (
+        ("temperature", "temperature"),
+        ("top_p", "top_p"),
+        ("top_k", "top_k"),
+        # OpenAI-compatible clients call this field ``seed`` while SGLang's
+        # native /generate API expects ``sampling_seed``. Dropping it here
+        # makes fixed eval seeds ineffective and turns checkpoint comparisons
+        # into unrelated samples.
+        ("seed", "sampling_seed"),
+    ):
         if src_k in body:
             sp[dst_k] = body[src_k]
 

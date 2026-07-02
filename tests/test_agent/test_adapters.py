@@ -213,7 +213,12 @@ def test_openai_chat_completions_nonstream_records_token_segments():
                 resp = await client.post(
                     "/v1/chat/completions",
                     headers={"Authorization": "Bearer sid-o"},
-                    json={"model": "m", "max_tokens": 4, "messages": [{"role": "user", "content": "hi?"}]},
+                    json={
+                        "model": "m",
+                        "max_tokens": 4,
+                        "seed": 0,
+                        "messages": [{"role": "user", "content": "hi?"}],
+                    },
                 )
                 data = await resp.json()
             finally:
@@ -225,6 +230,7 @@ def test_openai_chat_completions_nonstream_records_token_segments():
         assert data["choices"][0]["message"] == {"role": "assistant", "content": "hello"}
         assert data["choices"][0]["finish_reason"] == "stop"
         assert sglang.requests[0]["sampling_params"]["max_new_tokens"] == 4
+        assert sglang.requests[0]["sampling_params"]["sampling_seed"] == 0
         assert len(samples) == 1 and samples[0].tokens[-1] == 201 and samples[0].loss_mask[-1] == 1
 
     asyncio.run(run_case())
