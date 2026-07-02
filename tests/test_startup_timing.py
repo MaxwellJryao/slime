@@ -13,6 +13,9 @@ from slime.utils.startup_timing import (
 from slime.utils.timer import Timer
 
 
+NUM_GPUS = 0
+
+
 @pytest.mark.unit
 def test_launcher_startup_metrics_require_real_ordered_marker_pairs() -> None:
     second = 1_000_000_000
@@ -23,13 +26,13 @@ def test_launcher_startup_metrics_require_real_ordered_marker_pairs() -> None:
             "SLIME_CONTAINER_ENTRY_UNIX_NS": str(9 * second),
             "SLIME_JOB_SCRIPT_START_UNIX_NS": str(10 * second),
             "SLIME_RAY_READY_UNIX_NS": str(12 * second),
-            "SLIME_POLAR_ROLLOUT_START_UNIX_NS": str(12 * second),
-            "SLIME_POLAR_ROLLOUT_READY_UNIX_NS": str(13 * second),
-            "SLIME_POLAR_GATEWAY_START_UNIX_NS": str(13 * second),
-            "SLIME_POLAR_GATEWAY_READY_UNIX_NS": str(15 * second),
-            "SLIME_POLAR_UDS_START_UNIX_NS": str(15 * second),
-            "SLIME_POLAR_UDS_READY_UNIX_NS": str(16 * second),
-            "SLIME_POLAR_READY_UNIX_NS": str(16 * second),
+            "SLIME_ROLLOUT_SERVICE_START_UNIX_NS": str(12 * second),
+            "SLIME_ROLLOUT_SERVICE_READY_UNIX_NS": str(13 * second),
+            "SLIME_GATEWAY_START_UNIX_NS": str(13 * second),
+            "SLIME_GATEWAY_READY_UNIX_NS": str(15 * second),
+            "SLIME_UDS_TUNNEL_START_UNIX_NS": str(15 * second),
+            "SLIME_UDS_TUNNEL_READY_UNIX_NS": str(16 * second),
+            "SLIME_SERVICES_READY_UNIX_NS": str(16 * second),
         }
     )
 
@@ -38,11 +41,11 @@ def test_launcher_startup_metrics_require_real_ordered_marker_pairs() -> None:
         "timing/startup_outer_container_entry_time": 1.0,
         "timing/startup_container_entry_to_job_script_time": 1.0,
         "timing/startup_job_script_to_ray_ready_time": 2.0,
-        "timing/startup_polar_rollout_server_time": 1.0,
-        "timing/startup_polar_gateway_time": 2.0,
-        "timing/startup_polar_uds_tunnel_time": 1.0,
-        "timing/startup_polar_services_time": 4.0,
-        "timing/startup_job_script_to_polar_ready_time": 6.0,
+        "timing/startup_rollout_service_time": 1.0,
+        "timing/startup_gateway_time": 2.0,
+        "timing/startup_uds_tunnel_time": 1.0,
+        "timing/startup_services_time": 4.0,
+        "timing/startup_job_script_to_services_ready_time": 6.0,
     }
     assert elapsed_seconds_between_unix_ns("bad", 20 * second) is None
     assert elapsed_seconds_between_unix_ns(20 * second, 19 * second) is None
@@ -101,3 +104,7 @@ def test_startup_metrics_carry_the_axis_used_by_timing_wandb_metrics(
     assert step_key == expected_step_key
     assert metrics["train/step"] == 12
     assert metrics["rollout/step"] == expected_rollout_step
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

@@ -227,7 +227,6 @@ def _init_wandb_common(args):
     wandb.define_metric("rollout/*", step_metric=rollout_step_metric)
     wandb.define_metric("multi_turn/*", step_metric=rollout_step_metric)
     wandb.define_metric("passrate/*", step_metric=rollout_step_metric)
-    wandb.define_metric("polar/*", step_metric=rollout_step_metric)
     _define_gpu_sidecar_metric_axes(args)
     if getattr(args, "wandb_always_use_train_step", False):
         wandb.define_metric("eval/train_step")

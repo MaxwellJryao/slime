@@ -58,8 +58,8 @@ class RolloutDataSource(DataSource):
         self.sample_offset = 0
         # TODO remove this
         self.metadata = {}
-        # Polar's persistent async worker reserves samples on a background
-        # thread while the RolloutManager actor may checkpoint this object.
+        # A persistent async worker can reserve samples on a background thread
+        # while the RolloutManager actor checkpoints this object.
         # Serialize cursor mutation and snapshots so every saved state is a
         # coherent reservation boundary.
         self._state_lock = threading.RLock()

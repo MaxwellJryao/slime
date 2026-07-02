@@ -12,6 +12,9 @@ from slime.utils.wandb_utils import (
 )
 
 
+NUM_GPUS = 0
+
+
 def _args(*, always_use_train_step: bool) -> Namespace:
     return Namespace(
         wandb_always_use_train_step=always_use_train_step,
@@ -23,7 +26,7 @@ def _args(*, always_use_train_step: bool) -> Namespace:
 
 @pytest.mark.unit
 def test_set_wandb_step_uses_rollout_axis_by_default():
-    metrics = {"polar/reward_mean": 0.5}
+    metrics = {"custom/reward_mean": 0.5}
 
     step_key = set_wandb_step(
         _args(always_use_train_step=False),
@@ -39,7 +42,7 @@ def test_set_wandb_step_uses_rollout_axis_by_default():
 
 @pytest.mark.unit
 def test_set_wandb_step_attaches_scaled_train_axis():
-    metrics = {"polar/reward_mean": 0.5}
+    metrics = {"custom/reward_mean": 0.5}
 
     step_key = set_wandb_step(
         _args(always_use_train_step=True),
@@ -89,7 +92,7 @@ def test_pretrain_eval_metrics_start_at_train_step_zero():
 
 @pytest.mark.unit
 def test_completed_rollout_metrics_use_last_train_step():
-    metrics = {"polar/reward_mean": 0.5}
+    metrics = {"custom/reward_mean": 0.5}
 
     step_key = set_wandb_step(
         _args(always_use_train_step=True),
@@ -113,7 +116,7 @@ def test_logging_fails_fast_when_business_axis_is_missing(monkeypatch):
     monkeypatch.setattr(logging_utils.wandb, "log", lambda *_args, **_kwargs: called.append(True))
 
     with pytest.raises(KeyError, match="train/step"):
-        logging_utils.log(args, {"polar/reward_mean": 0.5}, step_key="train/step")
+        logging_utils.log(args, {"custom/reward_mean": 0.5}, step_key="train/step")
 
     assert called == []
 
@@ -171,7 +174,6 @@ def test_wandb_metric_definitions_use_explicit_axes(
         ("rollout/*", expected_rollout_axis),
         ("multi_turn/*", expected_rollout_axis),
         ("passrate/*", expected_rollout_axis),
-        ("polar/*", expected_rollout_axis),
         (
             "eval/train_step" if always_use_train_step else "eval/step",
             None,
@@ -185,12 +187,13 @@ def test_wandb_metric_definitions_use_explicit_axes(
             else []
         ),
     ]
+    assert all(name != "polar/*" for name, _ in definitions)
 
 
 @pytest.mark.unit
 def test_primary_predeclares_independent_gpu_node_axes(monkeypatch):
     definitions = []
-    monkeypatch.setenv("GPU_MONITOR_PREFIX", "polar_tmax_system")
+    monkeypatch.setenv("GPU_MONITOR_PREFIX", "test_system")
     monkeypatch.setenv("GPU_MONITOR_NODE_ROLE", "rank")
     monkeypatch.setenv("SLURM_NNODES", "4")
     monkeypatch.setattr(
@@ -200,24 +203,24 @@ def test_primary_predeclares_independent_gpu_node_axes(monkeypatch):
 
     _init_wandb_common(_args(always_use_train_step=True))
 
-    gpu_definitions = [item for item in definitions if item[0].startswith("polar_tmax_system/")]
+    gpu_definitions = [item for item in definitions if item[0].startswith("test_system/")]
     assert gpu_definitions == [
-        ("polar_tmax_system/node_0/train_step", None),
-        ("polar_tmax_system/node_0/*", "polar_tmax_system/node_0/train_step"),
-        ("polar_tmax_system/node_1/train_step", None),
-        ("polar_tmax_system/node_1/*", "polar_tmax_system/node_1/train_step"),
-        ("polar_tmax_system/node_2/train_step", None),
-        ("polar_tmax_system/node_2/*", "polar_tmax_system/node_2/train_step"),
-        ("polar_tmax_system/node_3/train_step", None),
-        ("polar_tmax_system/node_3/*", "polar_tmax_system/node_3/train_step"),
+        ("test_system/node_0/train_step", None),
+        ("test_system/node_0/*", "test_system/node_0/train_step"),
+        ("test_system/node_1/train_step", None),
+        ("test_system/node_1/*", "test_system/node_1/train_step"),
+        ("test_system/node_2/train_step", None),
+        ("test_system/node_2/*", "test_system/node_2/train_step"),
+        ("test_system/node_3/train_step", None),
+        ("test_system/node_3/*", "test_system/node_3/train_step"),
     ]
-    assert ("polar_tmax_system/*", "train/step") not in definitions
+    assert ("test_system/*", "train/step") not in definitions
 
 
 @pytest.mark.unit
 def test_primary_gpu_axes_follow_explicit_node_role(monkeypatch):
     definitions = []
-    monkeypatch.setenv("GPU_MONITOR_PREFIX", "polar_system")
+    monkeypatch.setenv("GPU_MONITOR_PREFIX", "cluster_system")
     monkeypatch.setenv("GPU_MONITOR_NODE_ROLE", "worker")
     monkeypatch.setenv("SLURM_NNODES", "2")
     monkeypatch.setattr(
@@ -228,12 +231,12 @@ def test_primary_gpu_axes_follow_explicit_node_role(monkeypatch):
     _init_wandb_common(_args(always_use_train_step=True))
 
     assert (
-        "polar_system/worker_node_0/*",
-        "polar_system/worker_node_0/train_step",
+        "cluster_system/worker_node_0/*",
+        "cluster_system/worker_node_0/train_step",
     ) in definitions
     assert (
-        "polar_system/worker_node_1/*",
-        "polar_system/worker_node_1/train_step",
+        "cluster_system/worker_node_1/*",
+        "cluster_system/worker_node_1/train_step",
     ) in definitions
 
 
@@ -242,7 +245,7 @@ def test_primary_gpu_axes_infer_actor_and_rollout_nodes(monkeypatch):
     definitions = []
     args = _args(always_use_train_step=True)
     args.actor_num_nodes = 2
-    monkeypatch.setenv("GPU_MONITOR_PREFIX", "polar_system")
+    monkeypatch.setenv("GPU_MONITOR_PREFIX", "cluster_system")
     monkeypatch.delenv("GPU_MONITOR_NODE_ROLE", raising=False)
     monkeypatch.setenv("SLURM_NNODES", "4")
     monkeypatch.setattr(
@@ -253,20 +256,20 @@ def test_primary_gpu_axes_infer_actor_and_rollout_nodes(monkeypatch):
     _init_wandb_common(args)
 
     assert (
-        "polar_system/actor_node_0/*",
-        "polar_system/actor_node_0/train_step",
+        "cluster_system/actor_node_0/*",
+        "cluster_system/actor_node_0/train_step",
     ) in definitions
     assert (
-        "polar_system/actor_node_1/*",
-        "polar_system/actor_node_1/train_step",
+        "cluster_system/actor_node_1/*",
+        "cluster_system/actor_node_1/train_step",
     ) in definitions
     assert (
-        "polar_system/rollout_node_2/*",
-        "polar_system/rollout_node_2/train_step",
+        "cluster_system/rollout_node_2/*",
+        "cluster_system/rollout_node_2/train_step",
     ) in definitions
     assert (
-        "polar_system/rollout_node_3/*",
-        "polar_system/rollout_node_3/train_step",
+        "cluster_system/rollout_node_3/*",
+        "cluster_system/rollout_node_3/train_step",
     ) in definitions
 
 
@@ -277,7 +280,7 @@ def test_primary_wandb_protobuf_contains_all_axis_globs(monkeypatch, tmp_path):
     from wandb.sdk.internal.datastore import DataStore
 
     monkeypatch.setenv("WANDB_SILENT", "true")
-    monkeypatch.setenv("GPU_MONITOR_PREFIX", "polar_tmax_system")
+    monkeypatch.setenv("GPU_MONITOR_PREFIX", "test_system")
     monkeypatch.setenv("GPU_MONITOR_NODE_ROLE", "rank")
     monkeypatch.setenv("SLURM_NNODES", "2")
     run = wandb.init(
@@ -306,12 +309,12 @@ def test_primary_wandb_protobuf_contains_all_axis_globs(monkeypatch, tmp_path):
     assert definitions["timing/*"] == "train/step"
     assert definitions["timing/eval/*"] == "eval/train_step"
     assert (
-        definitions["polar_tmax_system/node_0/*"]
-        == "polar_tmax_system/node_0/train_step"
+        definitions["test_system/node_0/*"]
+        == "test_system/node_0/train_step"
     )
     assert (
-        definitions["polar_tmax_system/node_1/*"]
-        == "polar_tmax_system/node_1/train_step"
+        definitions["test_system/node_1/*"]
+        == "test_system/node_1/train_step"
     )
 
 
@@ -327,7 +330,7 @@ def test_every_concrete_metric_gets_an_exact_axis_definition(monkeypatch):
 
     business_metrics = {
         "train/step": 7,
-        "polar/reward_mean": 0.5,
+        "custom/reward_mean": 0.5,
         "previously_unknown_namespace/value": 1.0,
         "_timestamp": 1234567890.0,
     }
@@ -346,7 +349,7 @@ def test_every_concrete_metric_gets_an_exact_axis_definition(monkeypatch):
     define_logged_metric_axes(eval_metrics, step_metric="eval/train_step")
 
     assert definitions == [
-        ("polar/reward_mean", "train/step"),
+        ("custom/reward_mean", "train/step"),
         ("previously_unknown_namespace/value", "train/step"),
         ("eval/tmax_holdout/reward_mean", "eval/train_step"),
         ("eval/terminal_bench_2_1/reward_mean", "eval/train_step"),
@@ -383,13 +386,13 @@ def test_logging_defines_exact_axes_before_publishing(monkeypatch):
 
     logging_utils.log(
         args,
-        {"polar/reward_mean": 0.25, "train/step": 4},
+        {"custom/reward_mean": 0.25, "train/step": 4},
         step_key="train/step",
     )
 
     assert calls == [
-        ("define", ("polar/reward_mean", "train/step"), "train/step"),
-        ("log", ("polar/reward_mean", "train/step")),
+        ("define", ("custom/reward_mean", "train/step"), "train/step"),
+        ("log", ("custom/reward_mean", "train/step")),
     ]
 
 
@@ -448,7 +451,7 @@ def test_eval_axis_rejects_mixed_business_metrics(monkeypatch):
             args,
             {
                 "eval/tmax_holdout": 0.25,
-                "polar/reward_mean": 0.5,
+                "custom/reward_mean": 0.5,
                 "eval/train_step": 0,
             },
             step_key="eval/train_step",
@@ -534,3 +537,7 @@ def test_secondary_wandb_writer_disables_console_capture(monkeypatch, mode):
     wandb_utils.init_wandb_secondary(args)
 
     assert initialized[0]["settings"]["console"] == "off"
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

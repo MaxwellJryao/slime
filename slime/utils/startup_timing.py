@@ -77,25 +77,25 @@ def launcher_startup_metrics(
             "SLIME_JOB_SCRIPT_START_UNIX_NS",
             "SLIME_RAY_READY_UNIX_NS",
         ),
-        "timing/startup_polar_rollout_server_time": (
-            "SLIME_POLAR_ROLLOUT_START_UNIX_NS",
-            "SLIME_POLAR_ROLLOUT_READY_UNIX_NS",
+        "timing/startup_rollout_service_time": (
+            "SLIME_ROLLOUT_SERVICE_START_UNIX_NS",
+            "SLIME_ROLLOUT_SERVICE_READY_UNIX_NS",
         ),
-        "timing/startup_polar_gateway_time": (
-            "SLIME_POLAR_GATEWAY_START_UNIX_NS",
-            "SLIME_POLAR_GATEWAY_READY_UNIX_NS",
+        "timing/startup_gateway_time": (
+            "SLIME_GATEWAY_START_UNIX_NS",
+            "SLIME_GATEWAY_READY_UNIX_NS",
         ),
-        "timing/startup_polar_uds_tunnel_time": (
-            "SLIME_POLAR_UDS_START_UNIX_NS",
-            "SLIME_POLAR_UDS_READY_UNIX_NS",
+        "timing/startup_uds_tunnel_time": (
+            "SLIME_UDS_TUNNEL_START_UNIX_NS",
+            "SLIME_UDS_TUNNEL_READY_UNIX_NS",
         ),
-        "timing/startup_polar_services_time": (
+        "timing/startup_services_time": (
             "SLIME_RAY_READY_UNIX_NS",
-            "SLIME_POLAR_READY_UNIX_NS",
+            "SLIME_SERVICES_READY_UNIX_NS",
         ),
-        "timing/startup_job_script_to_polar_ready_time": (
+        "timing/startup_job_script_to_services_ready_time": (
             "SLIME_JOB_SCRIPT_START_UNIX_NS",
-            "SLIME_POLAR_READY_UNIX_NS",
+            "SLIME_SERVICES_READY_UNIX_NS",
         ),
     }
     metrics: dict[str, float] = {}

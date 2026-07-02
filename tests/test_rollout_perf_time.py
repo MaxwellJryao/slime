@@ -4,6 +4,8 @@ import pytest
 
 from slime.ray import rollout as rollout_module
 
+NUM_GPUS = 0
+
 
 def _args() -> SimpleNamespace:
     return SimpleNamespace(
@@ -106,7 +108,7 @@ def test_speculative_rollout_metrics_wait_for_actor_commit(monkeypatch) -> None:
     manager.health_monitoring_resume = lambda: None
     manager._get_rollout_data = lambda *, rollout_id: (
         [f"sample-{rollout_id}"],
-        {"polar/reward_mean": 0.5},
+        {"service/reward_mean": 0.5},
     )
     manager._save_debug_rollout_data = lambda *_args, **_kwargs: None
     manager._convert_samples_to_train_data = lambda data: data
@@ -176,3 +178,7 @@ def test_failed_rollout_metric_emit_remains_pending_for_fail_fast_retry(monkeypa
         manager.commit_rollout_metrics(5)
 
     assert 5 in manager._pending_rollout_logs
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))
