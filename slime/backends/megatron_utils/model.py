@@ -39,6 +39,7 @@ from slime.utils.timer import Timer
 from slime.utils.train_progress import atomic_write_train_step
 
 from .checkpoint import load_checkpoint, save_checkpoint
+from .compat import repair_distributed_optimizer_param_index_maps
 from .cp_utils import reduce_train_step_metrics
 from .data import DataIterator, get_batch
 from .fp32_lm_head import assert_fp32_lm_head, fp32_lm_head_weight_dtypes
@@ -313,6 +314,12 @@ def setup_model_and_optimizer(
             config=config,
             model_chunks=model,
             use_gloo_process_groups=args.enable_gloo_process_groups,
+        )
+    repaired_optimizer_maps = repair_distributed_optimizer_param_index_maps(optimizer)
+    if repaired_optimizer_maps:
+        logger.info(
+            "Repaired %d mixed-dtype distributed optimizer checkpoint map(s)",
+            repaired_optimizer_maps,
         )
     if args.use_stateless_adam:
         _disable_distributed_optimizer_state_initialization(optimizer)
