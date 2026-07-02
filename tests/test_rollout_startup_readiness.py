@@ -6,6 +6,8 @@ import pytest
 
 from slime.ray import placement_group, rollout
 
+NUM_GPUS = 0
+
 
 class _RemoteMethod:
     def __init__(self, func):
@@ -169,3 +171,7 @@ def test_rollout_manager_ready_waits_and_starts_health_monitors_once(
     assert manager._engines_ready is True
     assert manager._health_monitors_started is True
     assert manager._ci_fault_injection_pending is True
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

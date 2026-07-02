@@ -60,3 +60,7 @@ def test_calculate_log_probs_and_entropy_controls_entropy_graph(monkeypatch, chu
             assert input_storage != source_storage
         else:
             assert input_storage == source_storage
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

@@ -1,9 +1,12 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from slime.backends.megatron_utils import checkpoint
 from slime.backends.megatron_utils.checkpoint import is_release_checkpoint
+
+NUM_GPUS = 0
 
 
 def test_release_checkpoint_is_model_seed(tmp_path):
@@ -54,3 +57,7 @@ def test_load_checkpoint_disables_autograd_for_state_restore(monkeypatch, tmp_pa
 
     model_parameter.sum().backward()
     torch.testing.assert_close(model_parameter.grad, torch.ones_like(model_parameter))
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

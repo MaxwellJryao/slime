@@ -6,6 +6,8 @@ import requests
 
 from slime.backends.sglang_utils import sglang_engine
 
+NUM_GPUS = 0
+
 
 class _FakeSession:
     def __init__(self, get):
@@ -151,3 +153,7 @@ def test_launch_server_process_terminates_tree_and_reaps_on_startup_failure(monk
     assert process.started
     assert killed_pids == [1234]
     assert process.join_timeouts == [10]
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

@@ -5,6 +5,8 @@ import pytest
 
 from slime.ray import rollout as rollout_module
 
+NUM_GPUS = 0
+
 
 class _FakeRemoteMethod:
     def __init__(self, host: str) -> None:
@@ -162,3 +164,7 @@ def test_fractional_actor_offset_uses_each_rollout_engines_actual_node(monkeypat
         "10.0.0.3": 2312,
         "10.0.0.4": 2312,
     }
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

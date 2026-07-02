@@ -5,6 +5,8 @@ import torch
 
 from slime.utils.ppo_utils import compute_dppo_loss
 
+NUM_GPUS = 0
+
 
 def _log_probs(values: list[float], *, requires_grad: bool = False) -> torch.Tensor:
     return torch.log(torch.tensor(values, dtype=torch.float64)).requires_grad_(requires_grad)
@@ -89,3 +91,7 @@ def test_dppo_rejects_unsupported_divergence() -> None:
             divergence_threshold=0.1,
             divergence_type="kl",
         )
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

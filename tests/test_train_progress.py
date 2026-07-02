@@ -1,6 +1,10 @@
 from pathlib import Path
 
+import pytest
+
 from slime.utils.train_progress import atomic_write_train_step
+
+NUM_GPUS = 0
 
 
 def test_atomic_write_train_step_replaces_complete_integer(tmp_path: Path):
@@ -17,3 +21,7 @@ def test_atomic_write_train_step_is_optional(monkeypatch):
     monkeypatch.delenv("SLIME_TRAIN_PROGRESS_FILE", raising=False)
 
     assert not atomic_write_train_step(4)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

@@ -24,6 +24,8 @@ assert_fp32_lm_head = _MODULE.assert_fp32_lm_head
 enable_fp32_lm_head = _MODULE.enable_fp32_lm_head
 fp32_lm_head_weight_dtypes = _MODULE.fp32_lm_head_weight_dtypes
 
+NUM_GPUS = 0
+
 
 class _FakeOutputLayer(torch.nn.Module):
     def __init__(self, hidden: int = 4, vocab: int = 7) -> None:
@@ -117,3 +119,7 @@ def test_fp32_head_is_ddp_optimizer_checkpoint_and_sync_surface_safe() -> None:
 def test_fp32_head_rejects_tied_output_weight() -> None:
     with pytest.raises(ValueError, match="requires untied"):
         enable_fp32_lm_head(_FakeGPT(tied=True))
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

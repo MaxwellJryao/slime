@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import os
 import sys
 import types
@@ -19,20 +20,32 @@ def install_paths() -> None:
     sys.path.insert(0, str(current.parents[2]))
 
 
+def _import_real_module_if_available(name: str) -> bool:
+    if name in sys.modules:
+        return True
+    try:
+        importlib.import_module(name)
+    except ModuleNotFoundError as exc:
+        if exc.name != name:
+            raise
+        return False
+    return True
+
+
 def install_stubs(*, with_sglang_router: bool = False, with_transformers: bool = False) -> None:
-    if "ray" not in sys.modules:
+    if not _import_real_module_if_available("ray"):
         ray_mod = types.ModuleType("ray")
         ray_mod._private = types.SimpleNamespace(
             services=types.SimpleNamespace(get_node_ip_address=lambda: "127.0.0.1")
         )
         sys.modules["ray"] = ray_mod
 
-    if with_sglang_router and "sglang_router" not in sys.modules:
+    if with_sglang_router and not _import_real_module_if_available("sglang_router"):
         mod = types.ModuleType("sglang_router")
         mod.__version__ = "0.2.3"
         sys.modules["sglang_router"] = mod
 
-    if with_transformers and "transformers" not in sys.modules:
+    if with_transformers and not _import_real_module_if_available("transformers"):
         mod = types.ModuleType("transformers")
         mod.AutoTokenizer = type(
             "AutoTokenizer", (), {"from_pretrained": staticmethod(lambda *args, **kwargs: object())}

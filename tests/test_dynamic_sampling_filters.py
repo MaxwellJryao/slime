@@ -1,9 +1,11 @@
 from types import SimpleNamespace
 
+import pytest
+
 from slime.rollout.filter_hub.dynamic_sampling_filters import check_reward_nonzero_std
 from slime.utils.types import Sample
 
-
+NUM_GPUS = 0
 ARGS = SimpleNamespace(reward_key=None)
 
 
@@ -78,3 +80,7 @@ def test_fully_masked_trajectory_does_not_count_as_preference_signal() -> None:
 
     assert output.keep is False
     assert output.reason == "insufficient_trajectories_1"
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

@@ -91,3 +91,7 @@ def test_logprob_guard_rejects_nonfinite_values():
             _rollout_data([-1.0, float("nan")], [-1.0, -1.0]),
             rollout_id=2,
         )
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

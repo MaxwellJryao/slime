@@ -7,6 +7,8 @@ import pytest
 import slime.ray.actor_group as actor_group_module
 from slime.ray.actor_group import RayTrainGroup
 
+NUM_GPUS = 0
+
 
 class _RemoteCall:
     def __init__(self, value):
@@ -126,3 +128,7 @@ def test_save_model_time_is_logged_at_producing_train_step(monkeypatch):
             "train/step",
         )
     ]
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

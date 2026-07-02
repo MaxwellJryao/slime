@@ -1,11 +1,15 @@
 import json
 
+import pytest
+
 from slime.utils.training_lifecycle import (
     final_eval_complete_marker_matches,
     graceful_exit_due,
     write_final_eval_complete_marker,
     write_training_complete_marker,
 )
+
+NUM_GPUS = 0
 
 
 def test_graceful_exit_due():
@@ -101,3 +105,7 @@ def test_final_eval_complete_marker_rejects_malformed_payload(tmp_path):
         num_rollout=2,
         eval_data_sha256="b" * 64,
     )
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

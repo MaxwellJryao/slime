@@ -5,6 +5,8 @@ import pytest
 from slime.rollout import data_source as data_source_module
 from slime.rollout.data_source import RolloutDataSource
 
+NUM_GPUS = 0
+
 
 def _args(tmp_path):
     return SimpleNamespace(
@@ -68,3 +70,7 @@ def test_resume_requires_exact_rollout_state_but_initial_seed_does_not(tmp_path)
     source.load(-1)
     with pytest.raises(FileNotFoundError, match="iteration 4.*exact matching rollout data-source state"):
         source.load(4)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))
