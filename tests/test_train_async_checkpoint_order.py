@@ -210,6 +210,7 @@ def _resume_args(tmp_path, **overrides):
         eval_interval=1_000_000,
         skip_eval_before_train=False,
         concurrent_pretrain_eval=True,
+        eval_resumed_checkpoint_before_train=False,
         rollout_batch_size=1,
         n_samples_per_prompt=1,
         global_batch_size=1,
@@ -221,7 +222,14 @@ def _resume_args(tmp_path, **overrides):
     return SimpleNamespace(**values)
 
 
-def _patch_resume_runtime(monkeypatch, events, rollout_manager, actor_model):
+def _patch_resume_runtime(
+    monkeypatch,
+    events,
+    rollout_manager,
+    actor_model,
+    *,
+    num_rollout_per_epoch=1,
+):
     monkeypatch.setattr(train_async, "configure_logger", lambda: None)
     monkeypatch.setattr(
         train_async, "create_placement_groups", lambda _args: {"rollout": object()}
@@ -229,7 +237,10 @@ def _patch_resume_runtime(monkeypatch, events, rollout_manager, actor_model):
     monkeypatch.setattr(
         train_async,
         "create_rollout_manager",
-        lambda _args, _pg, *, wait_ready: (rollout_manager, 1),
+        lambda _args, _pg, *, wait_ready: (
+            rollout_manager,
+            num_rollout_per_epoch,
+        ),
     )
     monkeypatch.setattr(
         train_async,
@@ -253,11 +264,129 @@ def _patch_resume_runtime(monkeypatch, events, rollout_manager, actor_model):
     monkeypatch.setattr(train_async.ray, "get", lambda value, **_kwargs: value)
 
 
+def test_resumed_checkpoint_eval_runs_once_before_first_rollout(
+    monkeypatch, tmp_path
+):
+    events = []
+    rollout_manager = _RolloutManager(events)
+    actor_model = _ActorModel(events)
+    args = _resume_args(
+        tmp_path,
+        start_rollout_id=40,
+        num_rollout=50,
+        training_complete_marker=None,
+        final_eval_complete_marker=None,
+        save_interval=None,
+        rollout_global_dataset=False,
+        eval_interval=10,
+        concurrent_pretrain_eval=False,
+        eval_resumed_checkpoint_before_train=True,
+    )
+    _patch_resume_runtime(
+        monkeypatch,
+        events,
+        rollout_manager,
+        actor_model,
+        num_rollout_per_epoch=None,
+    )
+
+    train_async.train(args)
+
+    eval_events = [event for event in events if event[0] == "eval"]
+    assert eval_events == [
+        ("eval", 39, True),
+        ("eval", 49, True),
+    ]
+    assert events.index(("weights", None)) < events.index(("eval", 39, True))
+    assert events.index(("eval", 39, True)) < events.index(("generate", 40))
+    assert events.index(("generate", 40)) < events.index(("train", 40))
+    assert [event for event in events if event[0] == "generate"] == [
+        ("generate", rollout_id) for rollout_id in range(40, 50)
+    ]
+    assert ("pretrain-eval-wait", None) not in events
+
+
+def test_resumed_checkpoint_eval_failure_stops_before_generation(
+    monkeypatch, tmp_path
+):
+    events = []
+    rollout_manager = _RolloutManager(events)
+
+    def fail_eval(rollout_id, completed_train_batch=True):
+        events.append(("eval", rollout_id, completed_train_batch))
+        raise RuntimeError("fixed eval failed")
+
+    rollout_manager.eval = _RemoteMethod(fail_eval)
+    args = _resume_args(
+        tmp_path,
+        start_rollout_id=40,
+        num_rollout=50,
+        training_complete_marker=None,
+        final_eval_complete_marker=None,
+        save_interval=None,
+        rollout_global_dataset=False,
+        eval_interval=10,
+        concurrent_pretrain_eval=False,
+        eval_resumed_checkpoint_before_train=True,
+    )
+    _patch_resume_runtime(
+        monkeypatch,
+        events,
+        rollout_manager,
+        _ActorModel(events),
+        num_rollout_per_epoch=None,
+    )
+
+    with pytest.raises(RuntimeError, match="fixed eval failed"):
+        train_async.train(args)
+
+    assert events.index(("weights", None)) < events.index(("eval", 39, True))
+    assert not any(event[0] == "generate" for event in events)
+    assert not any(event[0] == "train" for event in events)
+
+
+def test_resumed_checkpoint_without_opt_in_preserves_periodic_eval_only(
+    monkeypatch, tmp_path
+):
+    events = []
+    rollout_manager = _RolloutManager(events)
+    args = _resume_args(
+        tmp_path,
+        start_rollout_id=40,
+        num_rollout=50,
+        training_complete_marker=None,
+        final_eval_complete_marker=None,
+        save_interval=None,
+        rollout_global_dataset=False,
+        eval_interval=10,
+        concurrent_pretrain_eval=False,
+        eval_resumed_checkpoint_before_train=False,
+    )
+    _patch_resume_runtime(
+        monkeypatch,
+        events,
+        rollout_manager,
+        _ActorModel(events),
+        num_rollout_per_epoch=None,
+    )
+
+    train_async.train(args)
+
+    assert [event for event in events if event[0] == "eval"] == [
+        ("eval", 49, True)
+    ]
+    assert events.index(("generate", 40)) < events.index(("train", 40))
+
+
 def test_final_checkpoint_resume_runs_only_missing_eval(monkeypatch, tmp_path):
     events = []
     rollout_manager = _RolloutManager(events)
     actor_model = _ActorModel(events)
-    args = _resume_args(tmp_path)
+    args = _resume_args(
+        tmp_path,
+        eval_resumed_checkpoint_before_train=True,
+        concurrent_pretrain_eval=False,
+    )
     _patch_resume_runtime(monkeypatch, events, rollout_manager, actor_model)
     monkeypatch.setattr(
         train_async,

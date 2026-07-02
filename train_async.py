@@ -221,6 +221,27 @@ def train(args):
                     )
                 )
 
+        elif (
+            getattr(args, "eval_resumed_checkpoint_before_train", False)
+            and not args.skip_eval_before_train
+            and 0 < args.start_rollout_id < args.num_rollout
+        ):
+            # Numeric checkpoint N resumes at rollout N+1. Evaluate the
+            # already-synced checkpoint weights synchronously before any
+            # generation is queued, and label the row as the completed
+            # checkpoint rollout rather than the next untrained rollout.
+            resumed_checkpoint_id = args.start_rollout_id - 1
+            logger.info(
+                "Running fixed evaluation for resumed checkpoint %s before rollout %s",
+                resumed_checkpoint_id,
+                args.start_rollout_id,
+            )
+            ray.get(
+                rollout_manager.eval.remote(
+                    resumed_checkpoint_id,
+                    completed_train_batch=True,
+                )
+            )
     graceful_exit_deadline = getattr(args, "graceful_exit_at_unix_time", None)
     training_complete_marker = getattr(args, "training_complete_marker", None)
     final_eval_complete_marker = getattr(args, "final_eval_complete_marker", None)

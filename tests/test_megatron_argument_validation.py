@@ -244,6 +244,9 @@ def make_slime_validate_args(**overrides):
         finetune=False,
         start_rollout_id=None,
         eval_interval=None,
+        eval_resumed_checkpoint_before_train=False,
+        skip_eval_before_train=False,
+        concurrent_pretrain_eval=False,
         save_interval=None,
         save=None,
         kl_loss_coef=0,
@@ -324,6 +327,32 @@ def test_slime_validate_args_preserves_zero_rollout_gpus_under_colocate(monkeypa
     assert args.rollout_num_gpus == 0
     assert args.offload_train is True
     assert args.offload_rollout is True
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"eval_interval": None}, "requires --eval-interval"),
+        (
+            {"eval_interval": 1, "skip_eval_before_train": True},
+            "cannot be combined with --skip-eval-before-train",
+        ),
+        (
+            {"eval_interval": 1, "concurrent_pretrain_eval": True},
+            "cannot be combined with --concurrent-pretrain-eval",
+        ),
+    ],
+)
+def test_resumed_checkpoint_eval_flag_fails_closed(monkeypatch, overrides, message):
+    module = load_slime_arguments_module(monkeypatch)
+    args = make_slime_validate_args(
+        eval_resumed_checkpoint_before_train=True,
+        **overrides,
+    )
+
+    with pytest.raises(ValueError, match=message):
+        module.slime_validate_args(args)
 
 
 @pytest.mark.unit

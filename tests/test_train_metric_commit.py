@@ -21,7 +21,11 @@ class _RolloutManager:
         self.commit_rollout_metrics = _RemoteMethod(
             lambda rollout_id: events.append(("metrics-commit", rollout_id))
         )
-        self.eval = _RemoteMethod(lambda rollout_id: events.append(("eval", rollout_id)))
+        self.eval = _RemoteMethod(
+            lambda rollout_id, completed_train_batch=True: events.append(
+                ("eval", rollout_id, completed_train_batch)
+            )
+        )
         self.dispose = _RemoteMethod(lambda: events.append(("dispose", None)))
 
 
@@ -53,6 +57,7 @@ def _args() -> SimpleNamespace:
         eval_interval=None,
         start_rollout_id=0,
         skip_eval_before_train=True,
+        eval_resumed_checkpoint_before_train=False,
         use_critic=False,
         num_critic_only_steps=0,
         save_interval=None,
@@ -106,3 +111,21 @@ def test_sync_trainer_does_not_commit_failed_actor_batch(monkeypatch):
         train.train(_args())
 
     assert ("metrics-commit", 0) not in events
+
+
+def test_sync_trainer_evaluates_resumed_checkpoint_before_generation(monkeypatch):
+    events = []
+    _install_stubs(monkeypatch, events)
+    args = _args()
+    args.num_rollout = 42
+    args.start_rollout_id = 40
+    args.eval_interval = 10
+    args.skip_eval_before_train = False
+    args.eval_resumed_checkpoint_before_train = True
+
+    train.train(args)
+
+    initial_sync = events.index(("weights", None))
+    resumed_eval = events.index(("eval", 39, True))
+    first_generate = events.index(("generate", 40))
+    assert initial_sync < resumed_eval < first_generate

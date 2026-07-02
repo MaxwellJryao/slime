@@ -825,6 +825,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Whether to skip evaluation before training.",
             )
             parser.add_argument(
+                "--eval-resumed-checkpoint-before-train",
+                action="store_true",
+                default=False,
+                help=(
+                    "Synchronously evaluate the loaded numeric checkpoint before the first resumed rollout. "
+                    "The evaluation is labeled with start_rollout_id - 1 and never overlaps generation."
+                ),
+            )
+            parser.add_argument(
                 "--concurrent-pretrain-eval",
                 action="store_true",
                 default=False,
@@ -1842,6 +1851,20 @@ def _validate_update_weight_args(args) -> None:
 
 def slime_validate_args(args):
     args.eval_datasets = _resolve_eval_datasets(args)
+
+    if getattr(args, "eval_resumed_checkpoint_before_train", False):
+        if args.eval_interval is None:
+            raise ValueError(
+                "--eval-resumed-checkpoint-before-train requires --eval-interval"
+            )
+        if args.skip_eval_before_train:
+            raise ValueError(
+                "--eval-resumed-checkpoint-before-train cannot be combined with --skip-eval-before-train"
+            )
+        if args.concurrent_pretrain_eval:
+            raise ValueError(
+                "--eval-resumed-checkpoint-before-train cannot be combined with --concurrent-pretrain-eval"
+            )
 
     if getattr(args, "policy_loss_type", "ppo") == "dppo":
         if args.loss_type != "policy_loss":

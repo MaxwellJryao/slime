@@ -40,6 +40,19 @@ def train(args):
             )
         )
 
+    if (
+        args.eval_interval is not None
+        and getattr(args, "eval_resumed_checkpoint_before_train", False)
+        and not args.skip_eval_before_train
+        and 0 < args.start_rollout_id < args.num_rollout
+    ):
+        ray.get(
+            rollout_manager.eval.remote(
+                args.start_rollout_id - 1,
+                completed_train_batch=True,
+            )
+        )
+
     def offload_train(actor_trains_this_step):
         # Each model auto-offloads after train() when offload_train is set,
         # so we only need clear_memory for the non-offload case.
