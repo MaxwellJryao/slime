@@ -3,6 +3,8 @@ import os
 import re
 from pathlib import Path
 
+import torch
+
 # TODO: may need to copy those 2 functions and do refactoring.
 from megatron.training.checkpointing import load_checkpoint as _load_checkpoint_megatron
 from megatron.training.checkpointing import save_checkpoint
@@ -111,7 +113,9 @@ def is_release_checkpoint(path: str | Path | None) -> bool:
         return False
 
 
+@torch.no_grad()
 def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_context, skip_load_to_model_and_opt):
+    """Restore model and optimizer state without recording state copies in autograd."""
     # ref: how megatron `load_checkpoint` gets directory
     args = get_args()
     load_path = args.load
