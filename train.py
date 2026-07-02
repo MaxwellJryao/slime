@@ -6,7 +6,37 @@ from slime.utils.logging_utils import configure_logger, finish_tracking, init_tr
 from slime.utils.misc import should_run_periodic_action
 
 
+_SYNC_ASYNC_ONLY_ARGUMENTS = (
+    "graceful_exit_at_unix_time",
+    "training_complete_marker",
+    "final_eval_complete_marker",
+    "final_eval_data_sha256",
+    "concurrent_pretrain_eval",
+)
+
+
+def _validate_sync_mode_args(args) -> None:
+    configured = []
+    for name in _SYNC_ASYNC_ONLY_ARGUMENTS:
+        value = getattr(args, name, None)
+        if name == "concurrent_pretrain_eval":
+            is_configured = value is True
+        else:
+            # Numeric zero is still an explicit deadline and must not be
+            # mistaken for the default just because ``0 == False``.
+            is_configured = value is not None and value != ""
+        if is_configured:
+            configured.append(name)
+    if configured:
+        names = ", ".join(configured)
+        raise ValueError(
+            f"train.py does not implement async lifecycle argument(s): {names}; "
+            "use train_async.py"
+        )
+
+
 def train(args):
+    _validate_sync_mode_args(args)
     configure_logger()
     # allocate the GPUs
     pgs = create_placement_groups(args)

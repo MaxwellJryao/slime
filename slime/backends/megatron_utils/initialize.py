@@ -1,4 +1,3 @@
-import enum
 import logging
 import random
 
@@ -9,21 +8,12 @@ from megatron.core.config import set_experimental_flag
 from megatron.core.num_microbatches_calculator import init_num_microbatches_calculator
 from megatron.training.global_vars import _build_tokenizer, set_args
 
+from slime.backends.megatron_utils.compat import (
+    ensure_checkpoint_enum_compat,
+    warn_if_numpy_compatibility_is_unverified,
+)
+
 logger = logging.getLogger(__name__)
-
-
-def _ensure_checkpoint_enum_compat():
-    """Register checkpoint enum types missing from older Megatron checkouts."""
-    from megatron.core.transformer import enums as transformer_enums
-
-    if not hasattr(transformer_enums, "InferenceCudaGraphScope"):
-        inference_scope = enum.Enum(
-            "InferenceCudaGraphScope",
-            {"none": 1, "layer": 2, "block": 3},
-            module=transformer_enums.__name__,
-            qualname="InferenceCudaGraphScope",
-        )
-        setattr(transformer_enums, "InferenceCudaGraphScope", inference_scope)
 
 
 def _set_random_seed(
@@ -69,7 +59,7 @@ def _initialize_distributed(args, get_embedding_ranks=None, get_position_embeddi
 
 
 def init(args):
-    _ensure_checkpoint_enum_compat()
+    ensure_checkpoint_enum_compat()
     set_args(args)
     if args.enable_experimental:
         logger.info("Enable megatron experimental")
@@ -78,10 +68,7 @@ def init(args):
     # Pytorch distributed.
     _initialize_distributed(args)
 
-    # Older Megatron builds rejected numpy 2.x here. Current cw-dfw stacks parse
-    # and initialize with numpy 2.x, so warn instead of blocking conversion.
-    if not np.__version__.startswith("1."):
-        logger.warning("running Megatron initialization with numpy %s", np.__version__)
+    warn_if_numpy_compatibility_is_unverified(np.__version__, logger)
 
     # Random seeds for reproducibility.
     if args.rank == 0:

@@ -4,6 +4,8 @@ import pytest
 
 import train
 
+NUM_GPUS = 0
+
 
 class _RemoteMethod:
     def __init__(self, func):
@@ -129,3 +131,26 @@ def test_sync_trainer_evaluates_resumed_checkpoint_before_generation(monkeypatch
     resumed_eval = events.index(("eval", 39, True))
     first_generate = events.index(("generate", 40))
     assert initial_sync < resumed_eval < first_generate
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("graceful_exit_at_unix_time", 123),
+        ("graceful_exit_at_unix_time", 0),
+        ("training_complete_marker", "/tmp/complete"),
+        ("final_eval_complete_marker", "/tmp/eval-complete"),
+        ("final_eval_data_sha256", "a" * 64),
+        ("concurrent_pretrain_eval", True),
+    ],
+)
+def test_sync_trainer_rejects_async_only_lifecycle_arguments(name, value):
+    args = _args()
+    setattr(args, name, value)
+
+    with pytest.raises(ValueError, match=name):
+        train.train(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

@@ -229,6 +229,23 @@ def test_openai_chat_completions_nonstream_records_token_segments():
         assert data["object"] == "chat.completion"
         assert data["choices"][0]["message"] == {"role": "assistant", "content": "hello"}
         assert data["choices"][0]["finish_reason"] == "stop"
+        choice = data["choices"][0]
+        prompt_ids = sglang.requests[0]["input_ids"]
+        assert choice["input_token_ids"] == prompt_ids
+        assert choice["prompt_token_ids"] == prompt_ids
+        assert choice["token_ids"] == [201]
+        assert choice["logprobs"] == {
+            "content": [
+                {
+                    "token": "hello",
+                    "bytes": list(b"hello"),
+                    "logprob": -0.3,
+                    "token_id": 201,
+                    "top_logprobs": [],
+                }
+            ]
+        }
+        assert choice["meta_info"]["output_token_logprobs"] == [[-0.3, 201]]
         assert sglang.requests[0]["sampling_params"]["max_new_tokens"] == 4
         assert sglang.requests[0]["sampling_params"]["sampling_seed"] == 0
         assert len(samples) == 1 and samples[0].tokens[-1] == 201 and samples[0].loss_mask[-1] == 1

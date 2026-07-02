@@ -8,8 +8,12 @@ into a shared TrajectoryManager keyed by session id. finish_session(sid) drains
 a session's trajectory into a list of Sample.
 
 Only /v1/chat/completions is implemented; the Responses API (/v1/responses) is
-out of scope. The section layout (adapter class -> translation -> reply building
--> request framing) mirrors slime.agent.adapters.anthropic.
+out of scope. Non-stream responses extend the OpenAI choice object with
+``input_token_ids``, ``prompt_token_ids``, ``token_ids``, and ``meta_info``;
+when SGLang supplies per-token log probabilities they also include ``logprobs``.
+Polar consumes those fields to preserve the exact SGLang token trace used for
+RL training; they are an intentional internal protocol rather
+than generic OpenAI fields. The section layout mirrors the Anthropic adapter.
 """
 
 from __future__ import annotations
