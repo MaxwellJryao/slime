@@ -495,7 +495,7 @@ def test_wandb_finish_timeout_is_bounded_by_default(monkeypatch):
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("value", ["", "not-a-number", "0", "-1"])
+@pytest.mark.parametrize("value", ["", "not-a-number", "0", "-1", "nan", "inf", "-inf"])
 def test_invalid_wandb_finish_timeout_uses_bounded_default(monkeypatch, value):
     monkeypatch.setenv("WANDB_FINISH_TIMEOUT", value)
 

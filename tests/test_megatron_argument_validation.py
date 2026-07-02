@@ -318,6 +318,18 @@ def make_slime_validate_args(**overrides):
 
 
 @pytest.mark.unit
+def test_min_eval_samples_help_describes_warning_only_semantics(monkeypatch):
+    module = load_slime_arguments_module(monkeypatch)
+    parser = module.argparse.ArgumentParser()
+    module.get_slime_extra_args_provider()(parser)
+
+    help_text = parser._option_string_actions["--min-eval-samples"].help
+    assert "logged as warnings" in help_text
+    assert "training continues" in help_text
+    assert "fails" not in help_text
+
+
+@pytest.mark.unit
 def test_slime_validate_args_preserves_zero_rollout_gpus_under_colocate(monkeypatch):
     module = load_slime_arguments_module(monkeypatch)
     args = make_slime_validate_args(colocate=True, rollout_num_gpus=0)

@@ -61,9 +61,11 @@
       'label': 'run-ci-cpu-unittest',
       'always': True,
       'cpu': True,
+      'extra_pip_deps': 'wandb transformers',
       'tests': [
         {'test_file': 'test_megatron_argument_validation.py', 'num_gpus': 0},
         {'test_file': 'test_megatron_initialize_compat.py', 'num_gpus': 0},
+        {'test_file': 'test_wandb_step.py', 'num_gpus': 0},
         {'test_file': 'utils/test_megatron_server_arguments.py', 'num_gpus': 0},
         {'test_file': 'test_dp_schedule.py', 'num_gpus': 0},
         {'test_file': 'test_cp_utils.py', 'num_gpus': 0},
@@ -202,7 +204,7 @@ jobs:
             TEST_ARGS_ARRAY=()
           fi
           if [ "${{ matrix.info.num_gpus }}" = "0" ]; then
-            python "$TEST_PATH" "${TEST_ARGS_ARRAY[@]}"
+            python -m pytest -q "$TEST_PATH" "${TEST_ARGS_ARRAY[@]}"
           else
             python tests/ci/gpu_lock_exec.py --count ${{ matrix.info.num_gpus }} -- python "$TEST_PATH" "${TEST_ARGS_ARRAY[@]}"
           fi

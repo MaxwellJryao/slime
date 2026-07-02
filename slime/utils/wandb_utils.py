@@ -1,4 +1,5 @@
 import logging
+import math
 import os
 from copy import deepcopy
 
@@ -25,9 +26,9 @@ def _wandb_finish_timeout_seconds() -> float:
             _DEFAULT_WANDB_FINISH_TIMEOUT_SECONDS,
         )
         return _DEFAULT_WANDB_FINISH_TIMEOUT_SECONDS
-    if timeout <= 0:
+    if not math.isfinite(timeout) or timeout <= 0:
         logger.warning(
-            "WANDB_FINISH_TIMEOUT must be positive; using %.0fs",
+            "WANDB_FINISH_TIMEOUT must be finite and positive; using %.0fs",
             _DEFAULT_WANDB_FINISH_TIMEOUT_SECONDS,
         )
         return _DEFAULT_WANDB_FINISH_TIMEOUT_SECONDS

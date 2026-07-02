@@ -865,8 +865,8 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=int,
                 default=None,
                 help=(
-                    "Minimum number of valid eval samples required for each "
-                    "dataset; counts are logged before an insufficient eval fails."
+                    "Minimum expected valid-sample count for each dataset; "
+                    "shortfalls are logged as warnings and training continues."
                 ),
             )
 
