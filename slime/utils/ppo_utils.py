@@ -747,48 +747,58 @@ def calculate_log_probs_and_entropy(
     chunk_size: int = -1,
     log_prob_keep_mask=None,
     entropy_requires_grad: bool = True,
+    temperature: float = 1.0,
 ):
-    logits = logits.contiguous()
+    """Calculate token log-probs and entropy in bounded FP32 chunks.
+
+    ``Float16Module`` may now leave policy logits in BF16/FP16. Casting each
+    chunk here preserves the previous FP32 softmax/cross-entropy numerics
+    without materializing an FP32 copy of the complete sequence logits.
+    Temperature scaling deliberately happens after the cast, matching the old
+    full-output FP32 path exactly.
+    """
+    if temperature <= 0:
+        raise ValueError(f"temperature must be positive, got {temperature}")
+
     entropy = None
-    if logits.size(0) != 0:
-        if chunk_size > 0:
-            num_chunks = (logits.size(0) - 1) // chunk_size + 1
-            logits_chunks = logits.chunk(num_chunks, dim=0)
-            tokens_chunks = tokens.chunk(num_chunks, dim=0)
-            mask_chunks = (
-                log_prob_keep_mask.chunk(num_chunks, dim=0) if log_prob_keep_mask is not None else [None] * num_chunks
-            )
-
-            if with_entropy:
-                entropys = []
-                if entropy_requires_grad:
-                    for logits_chunk in logits_chunks:
-                        entropy_input = logits_chunk.clone()
-                        entropys.append(compute_entropy_from_logits(entropy_input, tp_group))
-                else:
-                    with torch.no_grad():
-                        for logits_chunk in logits_chunks:
-                            entropys.append(compute_entropy_from_logits(logits_chunk.detach(), tp_group))
-                entropy = torch.cat(entropys, dim=0)
-
-            log_probs = []
-            for tokens_chunk, logits_chunk, mask_chunk in zip(tokens_chunks, logits_chunks, mask_chunks, strict=True):
-                log_prob = compute_log_probs(logits_chunk.clone(), tokens_chunk, tp_group, keep_mask=mask_chunk)
-                log_probs.append(log_prob)
-            log_prob = torch.cat(log_probs, dim=0)
-        else:
-            if with_entropy:
-                if entropy_requires_grad:
-                    entropy_input = logits.clone()
-                    entropy = compute_entropy_from_logits(entropy_input, tp_group)
-                else:
-                    with torch.no_grad():
-                        entropy = compute_entropy_from_logits(logits.detach(), tp_group)
-
-            log_prob = compute_log_probs(logits.clone(), tokens, tp_group, keep_mask=log_prob_keep_mask)
-    else:
-        log_prob = logits.new_zeros((0,))
+    if logits.size(0) == 0:
+        fp32_logits = logits.float()
+        log_prob = fp32_logits.new_zeros((0,))
         if with_entropy:
-            entropy = logits.new_zeros((0,))
+            entropy = fp32_logits.new_zeros((0,))
+        return log_prob, entropy
+
+    effective_chunk_size = chunk_size if chunk_size > 0 else logits.size(0)
+    logits_chunks = logits.split(effective_chunk_size, dim=0)
+    tokens_chunks = tokens.split(effective_chunk_size, dim=0)
+    mask_chunks = (
+        log_prob_keep_mask.split(effective_chunk_size, dim=0)
+        if log_prob_keep_mask is not None
+        else [None] * len(logits_chunks)
+    )
+
+    log_probs = []
+    entropys = []
+    for tokens_chunk, logits_chunk, mask_chunk in zip(tokens_chunks, logits_chunks, mask_chunks, strict=True):
+        # Do not call contiguous()/float() on the parent tensor: at 64K that
+        # would recreate the allocation this response-only path is avoiding.
+        logits_chunk = logits_chunk.float()
+        if temperature != 1.0:
+            logits_chunk = logits_chunk / temperature
+        logits_chunk = logits_chunk.contiguous()
+
+        if with_entropy:
+            if entropy_requires_grad:
+                entropy_chunk = compute_entropy_from_logits(logits_chunk.clone(), tp_group)
+            else:
+                with torch.no_grad():
+                    entropy_chunk = compute_entropy_from_logits(logits_chunk.detach(), tp_group)
+            entropys.append(entropy_chunk)
+
+        log_probs.append(compute_log_probs(logits_chunk.clone(), tokens_chunk, tp_group, keep_mask=mask_chunk))
+
+    log_prob = torch.cat(log_probs, dim=0)
+    if with_entropy:
+        entropy = torch.cat(entropys, dim=0)
 
     return log_prob, entropy

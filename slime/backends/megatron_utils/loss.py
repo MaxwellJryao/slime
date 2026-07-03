@@ -71,7 +71,7 @@ def get_responses(
 
     Args:
         logits: Model outputs with shape `[1, T, V]` (policy) or `[1, T, 1]`
-            (value). Must be float32.
+            (value). May be FP32, BF16, or FP16.
         args: Configuration containing `rollout_temperature` for optional scaling.
         unconcat_tokens: List of token tensors (prompt+response) per sample.
         total_lengths: Total sequence lengths (prompt+response) per sample.
@@ -83,7 +83,7 @@ def get_responses(
         `[R, V]` (policy) or `[R, 1]` (value) and `tokens_chunk` is shape `[R]`
         (1D int64), both aligned to response tokens for one sample.
     """
-    assert logits.dtype == torch.float32, f"{logits.dtype}"
+    assert logits.dtype in (torch.float32, torch.bfloat16, torch.float16), f"{logits.dtype}"
     assert len(logits.shape) == 3, f"{logits.shape}"
     assert logits.size(0) == 1, f"{logits.shape}"
     logits = logits.squeeze(0)
@@ -483,14 +483,77 @@ def get_log_probs_and_entropy(
 ) -> dict[str, list[torch.Tensor]]:
     """Compute per-token log-probabilities (and optionally entropy) on responses.
 
-    Computes on the **full** logits ``[T, V]`` tensor at once (instead of
-    per-sample slicing) so backward traverses ``[T, V]`` only once, then
-    extracts per-sample response portions.
+    The default top-p=1 path slices response rows while logits are still in
+    model precision, then converts only bounded response chunks to FP32 for
+    softmax/cross-entropy. This avoids a full ``[T, V]`` FP32 allocation while
+    preserving the previous FP32 loss numerics and gradients.
+
+    Top-p replay still uses its legacy full-logits keep-mask implementation.
+    Callers must provide FP32 logits for that path; model.py deliberately keeps
+    ``fp32_output=True`` when rollout top-p is enabled.
 
     When ``entropy_coef == 0``, entropy is computed under ``torch.no_grad()``
     to avoid retaining the computation graph and to skip cloning.
     """
     assert non_loss_data
+    if (top_p_token_ids is None) != (top_p_token_offsets is None):
+        raise ValueError("top_p_token_ids and top_p_token_offsets must be provided together")
+
+    # Fast/default path: slice in BF16/FP16 first and cast only response chunks.
+    if top_p_token_ids is None:
+        assert logits.dtype in (torch.float32, torch.bfloat16, torch.float16), f"{logits.dtype}"
+        assert len(logits.shape) == 3, f"{logits.shape}"
+        assert logits.size(0) == 1, f"{logits.shape}"
+
+        tp_group = mpu.get_tensor_model_parallel_group()
+        chunk_size = args.log_probs_chunk_size
+        need_entropy_grad = with_entropy and args.entropy_coef != 0
+        log_probs_list = []
+        entropy_list = []
+
+        for logits_chunk, tokens_chunk in get_responses(
+            logits,
+            args=args,
+            unconcat_tokens=unconcat_tokens,
+            total_lengths=total_lengths,
+            response_lengths=response_lengths,
+            apply_temperature=False,
+        ):
+            log_prob, entropy = calculate_log_probs_and_entropy(
+                logits_chunk,
+                tokens_chunk,
+                tp_group,
+                with_entropy=with_entropy,
+                chunk_size=chunk_size,
+                entropy_requires_grad=need_entropy_grad,
+                temperature=getattr(args, "rollout_temperature", 1.0),
+            )
+            log_probs_list.append(log_prob.squeeze(-1))
+            if with_entropy:
+                entropy_list.append(entropy)
+
+        res = {"log_probs": log_probs_list}
+        if with_entropy:
+            res["entropy"] = entropy_list
+
+        # Convert contiguous allgather-CP ownership back to the zigzag response
+        # layout consumed by the rest of Slime.
+        if args.allgather_cp:
+            _allgather_cp_redistribute(
+                res,
+                logits_local_len=logits.size(1),
+                total_lengths=total_lengths,
+                response_lengths=response_lengths,
+            )
+
+        return torch.empty((0,), device=logits.device), res
+
+    # Legacy top-p replay path. Its full [T,V] keep-mask is not response-only;
+    # fail closed if a caller accidentally combines it with half logits.
+    if logits.dtype != torch.float32:
+        raise ValueError(
+            "top-p replay requires full FP32 logits; response-only FP32 currently supports rollout_top_p=1 only"
+        )
     assert logits.dtype == torch.float32, f"{logits.dtype}"
     assert len(logits.shape) == 3, f"{logits.shape}"
     assert logits.size(0) == 1, f"{logits.shape}"

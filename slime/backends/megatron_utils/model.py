@@ -46,11 +46,27 @@ from .compat import (
 from .cp_utils import reduce_train_step_metrics
 from .data import DataIterator, get_batch
 from .fp32_lm_head import assert_fp32_lm_head, fp32_lm_head_weight_dtypes
-from .loss import ROLLOUT_TOP_P_TOKEN_KEYS, get_rollout_top_p_logprob_kwargs, loss_function
+from .loss import (
+    ROLLOUT_TOP_P_TOKEN_KEYS,
+    get_log_probs_and_entropy,
+    get_rollout_top_p_logprob_kwargs,
+    loss_function,
+)
 from .model_provider import get_model_provider_func
 from .stateless_adam import StatelessAdam
 
 logger = logging.getLogger(__name__)
+
+
+def _use_response_only_fp32_logits(args: Namespace) -> bool:
+    """Whether policy outputs can stay in model precision until response slicing.
+
+    Top-p replay still builds a full-vocabulary keep-mask aligned to every
+    sequence row, so it retains the legacy full-FP32 output path. Value and
+    custom losses are likewise left unchanged by callers of this helper.
+    """
+    mixed_precision = bool(getattr(args, "bf16", False) or getattr(args, "fp16", False))
+    return mixed_precision and getattr(args, "rollout_top_p", 1.0) == 1.0
 
 
 def _disable_tqdm_for_non_main_rank() -> bool:
@@ -448,6 +464,10 @@ def forward_only(
         }
         if batch["multimodal_train_inputs"] is not None:
             forward_kwargs.update(batch["multimodal_train_inputs"])
+        if f is get_log_probs_and_entropy and _use_response_only_fp32_logits(args):
+            # Float16Module otherwise materializes a full [T,V] FP32 copy on
+            # the last PP stage. The loss path casts bounded response chunks.
+            forward_kwargs["fp32_output"] = False
         output_tensor = model(**forward_kwargs)
 
         output_kwargs = {
@@ -649,6 +669,9 @@ def train_one_step(
 
             if args.enable_mtp_training:
                 forward_kwargs["mtp_kwargs"] = {"mtp_labels": batch["tokens"]}
+
+            if args.loss_type in ("policy_loss", "sft_loss") and _use_response_only_fp32_logits(args):
+                forward_kwargs["fp32_output"] = False
 
             output_tensor = model(**forward_kwargs)
 
