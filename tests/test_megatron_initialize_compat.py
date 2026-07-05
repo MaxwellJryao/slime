@@ -5,10 +5,12 @@ import types
 from unittest.mock import Mock
 
 import pytest
+import torch
 
 from slime.backends.megatron_utils.compat import (
     ensure_checkpoint_enum_compat,
     repair_distributed_optimizer_param_index_maps,
+    repair_hybrid_optimizer_native_fp32_offload_sync,
     warn_if_numpy_compatibility_is_unverified,
 )
 
@@ -128,6 +130,98 @@ def test_mixed_dtype_checkpoint_map_rejects_unexpected_shard_order() -> None:
 
     with pytest.raises(RuntimeError, match="shard order"):
         repair_distributed_optimizer_param_index_maps(distributed_optimizer)
+
+
+def _mixed_native_fp32_offload_optimizer():
+    hybrid_optimizer_type = type("HybridDeviceOptimizer", (), {})
+    hybrid_optimizer = hybrid_optimizer_type()
+    hybrid_optimizer.param_update_in_fp32 = True
+
+    model_fp32 = torch.tensor([3.0, 5.0], dtype=torch.float32)
+    model_bf16 = torch.tensor([7.0, 11.0], dtype=torch.bfloat16)
+    inner_fp32 = torch.zeros_like(model_fp32)
+    inner_bf16 = torch.zeros_like(model_bf16, dtype=torch.float32)
+    hybrid_optimizer.param_to_inner_param = {
+        model_fp32: inner_fp32,
+        model_bf16: inner_bf16,
+    }
+    hybrid_optimizer.param_to_fp32_param = {model_bf16: inner_bf16}
+    hybrid_optimizer.state = {}
+    hybrid_optimizer.update_fp32_param_by_new_param = lambda: None
+    hybrid_optimizer._update_fp32_params_by_new_state = lambda: None
+
+    distributed_optimizer_type = type("DistributedOptimizer", (), {})
+    distributed_optimizer = distributed_optimizer_type()
+    distributed_optimizer.optimizer = hybrid_optimizer
+    optimizer = types.SimpleNamespace(chained_optimizers=[distributed_optimizer])
+    return optimizer, hybrid_optimizer, model_fp32, model_bf16, inner_fp32, inner_bf16
+
+
+def test_mixed_native_fp32_cpu_offload_sync_is_repaired_and_idempotent() -> None:
+    (
+        optimizer,
+        hybrid_optimizer,
+        model_fp32,
+        model_bf16,
+        inner_fp32,
+        inner_bf16,
+    ) = _mixed_native_fp32_offload_optimizer()
+
+    assert repair_hybrid_optimizer_native_fp32_offload_sync(optimizer) == 1
+    assert repair_hybrid_optimizer_native_fp32_offload_sync(optimizer) == 0
+
+    # Release/model-only load: both the cast BF16 shard and the already-FP32
+    # offloaded shard must refresh their detached CPU masters.
+    hybrid_optimizer.update_fp32_param_by_new_param()
+    torch.testing.assert_close(inner_fp32, model_fp32)
+    torch.testing.assert_close(inner_bf16, model_bf16.float())
+
+    # Numbered checkpoint load: HDO rebuilds its inner parameters before this
+    # hook, so both masters must be refreshed from loaded optimizer state.
+    loaded_fp32 = torch.tensor([13.0, 17.0])
+    loaded_bf16_master = torch.tensor([19.0, 23.0])
+    reloaded_inner_fp32 = torch.zeros_like(inner_fp32)
+    reloaded_inner_bf16 = torch.zeros_like(inner_bf16)
+    hybrid_optimizer.param_to_inner_param = {
+        model_fp32: reloaded_inner_fp32,
+        model_bf16: reloaded_inner_bf16,
+    }
+    hybrid_optimizer.param_to_fp32_param = {
+        model_bf16: reloaded_inner_bf16,
+    }
+    hybrid_optimizer.state = {
+        model_fp32: {"master_param": loaded_fp32},
+        model_bf16: {"master_param": loaded_bf16_master},
+    }
+    hybrid_optimizer._update_fp32_params_by_new_state()
+    torch.testing.assert_close(reloaded_inner_fp32, loaded_fp32)
+    torch.testing.assert_close(reloaded_inner_bf16, loaded_bf16_master)
+
+
+def test_native_fp32_offload_sync_patch_is_narrowly_gated() -> None:
+    optimizer, hybrid_optimizer, model_fp32, _, _, _ = _mixed_native_fp32_offload_optimizer()
+
+    # A native FP32 parameter that remains on device does not need the repair.
+    hybrid_optimizer.param_to_inner_param[model_fp32] = model_fp32
+    assert repair_hybrid_optimizer_native_fp32_offload_sync(optimizer) == 0
+
+    # Likewise, an all-lower-precision optimizer has complete upstream maps.
+    hybrid_optimizer.param_to_inner_param.pop(model_fp32)
+    assert repair_hybrid_optimizer_native_fp32_offload_sync(optimizer) == 0
+
+
+def test_mixed_native_fp32_cpu_offload_sync_fails_closed_on_bad_state() -> None:
+    optimizer, hybrid_optimizer, model_fp32, _, _, _ = _mixed_native_fp32_offload_optimizer()
+    assert repair_hybrid_optimizer_native_fp32_offload_sync(optimizer) == 1
+
+    hybrid_optimizer.state = {model_fp32: {}}
+    with pytest.raises(RuntimeError, match="missing master_param"):
+        hybrid_optimizer._update_fp32_params_by_new_state()
+
+    unknown_param = torch.tensor([29.0, 31.0])
+    hybrid_optimizer.state = {unknown_param: {"master_param": unknown_param.clone()}}
+    with pytest.raises(RuntimeError, match="unknown parameter"):
+        hybrid_optimizer._update_fp32_params_by_new_state()
 
 
 if __name__ == "__main__":
