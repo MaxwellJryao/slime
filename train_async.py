@@ -11,6 +11,7 @@ from slime.ray.placement_group import (
     create_rollout_manager,
     create_training_models,
 )
+from slime.ray.rollout import commit_rollout_metrics_from_journal
 from slime.utils import logging_utils
 from slime.utils.arguments import parse_args
 from slime.utils.logging_utils import configure_logger, finish_tracking, init_tracking
@@ -184,6 +185,19 @@ def train(args):
         critic_model,
         rollout_manager,
     )
+    # A previous allocation may have died after checkpoint N became durable
+    # but while commit_rollout_metrics(N) was queued behind generate(N+1).
+    # Replay only journals covered by the loaded checkpoint before new
+    # generation starts; speculative journals beyond that frontier stay
+    # uncommitted and will be replaced when their rollout is regenerated.
+    recovered_rollout_metrics = ray.get(
+        rollout_manager.recover_rollout_metrics.remote(args.start_rollout_id - 1)
+    )
+    if recovered_rollout_metrics:
+        logger.info(
+            "Recovered rollout metrics for checkpointed batches %s",
+            recovered_rollout_metrics,
+        )
     startup_metrics["timing/startup_trainer_rollout_wiring_time"] = (
         time.perf_counter() - trainer_rollout_wiring_started_at
     )
@@ -322,6 +336,7 @@ def train(args):
     completed_all_rollouts = True
     exit_before_first_rollout = False
     rollout_data_next_future = None
+    rollout_metrics_ack_future = None
     if args.start_rollout_id < args.num_rollout:
         if graceful_exit_due(graceful_exit_deadline):
             completed_all_rollouts = False
@@ -344,6 +359,12 @@ def train(args):
         # Sync the last generation
         if rollout_data_next_future is not None:
             rollout_data_curr_ref = ray.get(rollout_data_next_future)
+        if rollout_metrics_ack_future is not None:
+            # The acknowledgement was queued behind the generation just
+            # consumed above.  It only releases actor memory; telemetry was
+            # already durably emitted by the driver.
+            ray.get(rollout_metrics_ack_future)
+            rollout_metrics_ack_future = None
 
         save_due = should_run_periodic_action(
             rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout
@@ -400,6 +421,20 @@ def train(args):
             if args.use_critic:
                 critic_model.save_model(rollout_id, force_sync=True)
 
+        # The fsynced journal was created before generate() returned.  Emit it
+        # from the driver now instead of entering the RolloutManager FIFO,
+        # where generate(N+1) may run for minutes.  The actor acknowledgement
+        # is intentionally fire-and-overlap here and is drained only after the
+        # already-needed generation wait.
+        metrics_committed_from_journal = commit_rollout_metrics_from_journal(
+            args,
+            rollout_id,
+        )
+        if metrics_committed_from_journal:
+            rollout_metrics_ack_future = (
+                rollout_manager.acknowledge_rollout_metrics.remote(rollout_id)
+            )
+
         if pretrain_eval_due and getattr(args, "concurrent_pretrain_eval", False):
             # Rollout 0 no longer waits for the long tail of the fixed
             # baseline, so the first actor step can use otherwise-idle trainer
@@ -411,7 +446,9 @@ def train(args):
         # Rollout N+1 may already be prefetched, but only batch N has now been
         # consumed successfully by the actor.  Commit its reward/service/perf
         # metrics here so an untrained speculative batch never reaches W&B.
-        ray.get(rollout_manager.commit_rollout_metrics.remote(rollout_id))
+        # Runs without a checkpoint directory retain the legacy in-actor path.
+        if not metrics_committed_from_journal:
+            ray.get(rollout_manager.commit_rollout_metrics.remote(rollout_id))
 
         if graceful_exit:
             completed_all_rollouts = False
@@ -430,6 +467,9 @@ def train(args):
                 ray.get(x) if (x := rollout_data_next_future) is not None else None
             )
             rollout_data_next_future = None
+            if rollout_metrics_ack_future is not None:
+                ray.get(rollout_metrics_ack_future)
+                rollout_metrics_ack_future = None
             actor_model.update_weights(rollout_id=rollout_id)
 
         if should_run_periodic_action(
@@ -466,6 +506,9 @@ def train(args):
                 final_eval_marker_valid = True
 
     if completed_all_rollouts:
+        if rollout_metrics_ack_future is not None:
+            ray.get(rollout_metrics_ack_future)
+            rollout_metrics_ack_future = None
         if require_final_eval_marker and not final_eval_marker_valid:
             raise RuntimeError(
                 "All rollouts are checkpointed, but the required final evaluation did not complete"

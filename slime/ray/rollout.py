@@ -4,6 +4,7 @@ import logging
 import multiprocessing
 import os
 import random
+import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
@@ -40,6 +41,8 @@ logger = logging.getLogger(__name__)
 _DEFAULT_ROLLOUT_BASE_PORT = 2048
 _ROLLOUT_PORT_BLOCK_SIZE = 320
 _EPHEMERAL_PORT_LOWER_FALLBACK = 32768
+_ROLLOUT_METRICS_JOURNAL_VERSION = 1
+_ROLLOUT_METRICS_JOURNAL_DIR = "rollout_metrics_journal"
 
 
 @dataclasses.dataclass(slots=True)
@@ -47,6 +50,144 @@ class _PendingRolloutLog:
     samples: Any
     extra_metrics: dict[str, Any] | None
     rollout_time: float
+    prepared_log_dict: dict[str, Any] | None = None
+
+
+def _rollout_metrics_journal_paths(
+    args,
+    rollout_id: int,
+    *,
+    checkpoint_root: str | os.PathLike[str] | None = None,
+) -> tuple[Path, Path] | None:
+    """Return pending/emitted journal paths when checkpointing is configured."""
+
+    root = checkpoint_root if checkpoint_root is not None else getattr(args, "save", None)
+    if root is None:
+        return None
+    journal_dir = Path(root) / "rollout" / _ROLLOUT_METRICS_JOURNAL_DIR
+    stem = f"rollout_{int(rollout_id):07d}"
+    return journal_dir / f"{stem}.pending.pt", journal_dir / f"{stem}.emitted"
+
+
+def _fsync_directory(path: Path) -> None:
+    directory_fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def _atomic_torch_save(payload: Any, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(
+        f"{path.name}.tmp.{os.getpid()}.{threading.get_ident()}"
+    )
+    try:
+        with open(temporary, "wb") as stream:
+            torch.save(payload, stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        _fsync_directory(path.parent)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _atomic_write_rollout_metrics_marker(path: Path, rollout_id: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(
+        f"{path.name}.tmp.{os.getpid()}.{threading.get_ident()}"
+    )
+    try:
+        with open(temporary, "w", encoding="utf-8") as stream:
+            stream.write(
+                f"version={_ROLLOUT_METRICS_JOURNAL_VERSION}\n"
+                f"rollout_id={int(rollout_id)}\n"
+            )
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        _fsync_directory(path.parent)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _load_rollout_metrics_journal(
+    pending_path: Path,
+    expected_rollout_id: int,
+) -> _PendingRolloutLog:
+    payload = torch.load(pending_path, map_location="cpu", weights_only=False)
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"invalid rollout metrics journal payload: {pending_path}")
+    if payload.get("version") != _ROLLOUT_METRICS_JOURNAL_VERSION:
+        raise RuntimeError(
+            f"unsupported rollout metrics journal version in {pending_path}: "
+            f"{payload.get('version')!r}"
+        )
+    if payload.get("rollout_id") != expected_rollout_id:
+        raise RuntimeError(
+            f"rollout metrics journal id mismatch in {pending_path}: "
+            f"expected {expected_rollout_id}, got {payload.get('rollout_id')!r}"
+        )
+    pending = payload.get("pending")
+    if not isinstance(pending, _PendingRolloutLog):
+        raise RuntimeError(f"invalid pending rollout metrics in {pending_path}")
+    return pending
+
+
+def _mark_rollout_metrics_journal_emitted(
+    rollout_id: int,
+    pending_path: Path,
+    emitted_path: Path,
+) -> None:
+    if not pending_path.is_file():
+        raise FileNotFoundError(
+            f"cannot mark missing rollout metrics payload emitted: {pending_path}"
+        )
+    _atomic_write_rollout_metrics_marker(emitted_path, rollout_id)
+
+
+def commit_rollout_metrics_from_journal(args, rollout_id: int) -> bool:
+    """Commit a fsynced rollout metric payload without entering the actor FIFO.
+
+    Returns ``False`` when checkpoint journaling is unavailable, allowing the
+    caller to use the legacy in-actor path.  The compact payload is retained
+    after emission as a local durable audit record, while an emitted marker
+    makes retries locally idempotent.  As with any external tracker, a process
+    loss after the tracker accepts a row but before the local marker fsync may
+    replay that same business step once; it cannot silently lose the record.
+    """
+
+    paths = _rollout_metrics_journal_paths(args, rollout_id)
+    if paths is None:
+        return False
+    pending_path, emitted_path = paths
+    if emitted_path.exists():
+        if not pending_path.is_file():
+            raise FileNotFoundError(
+                f"rollout metrics emitted marker has no durable payload for "
+                f"batch {rollout_id}: {pending_path}"
+            )
+        return True
+    if not pending_path.is_file():
+        raise FileNotFoundError(
+            f"missing durable rollout metrics journal for batch {rollout_id}: "
+            f"{pending_path}"
+        )
+    pending = _load_rollout_metrics_journal(pending_path, rollout_id)
+    _emit_pending_rollout_log(rollout_id, args, pending)
+    _mark_rollout_metrics_journal_emitted(
+        rollout_id,
+        pending_path,
+        emitted_path,
+    )
+    return True
 
 
 def _get_ephemeral_port_lower_bound() -> int:
@@ -508,6 +649,7 @@ class RolloutManager:
         # while actor N is still training.  Hold its business metrics until
         # the driver confirms that the corresponding actor batch succeeded.
         self._pending_rollout_logs: dict[int, _PendingRolloutLog] = {}
+        self._pending_rollout_log_paths: dict[int, Path] = {}
         # The fixed pre-train eval may have a much longer tail than rollout 0.
         # Keep it alive after rollout 0 is handed to the actor so the first
         # training step can overlap that tail.  The driver calls
@@ -597,6 +739,7 @@ class RolloutManager:
                     sorted(pending_logs),
                 )
                 pending_logs.clear()
+                getattr(self, "_pending_rollout_log_paths", {}).clear()
             for monitor in self._health_monitors:
                 monitor.stop()
             logging_utils.finish_tracking(self.args)
@@ -684,7 +827,10 @@ class RolloutManager:
         )
         if rollout_id in self._pending_rollout_logs:
             raise RuntimeError(f"rollout metrics for batch {rollout_id} are already pending")
+        journal_path = self._persist_pending_rollout_log(rollout_id, pending_log)
         self._pending_rollout_logs[rollout_id] = pending_log
+        if journal_path is not None:
+            self._pending_rollout_log_paths[rollout_id] = journal_path
         return train_data
 
     def generate_with_pretrain_eval(self, rollout_id):
@@ -738,20 +884,175 @@ class RolloutManager:
             if executor is not None:
                 executor.shutdown(wait=True, cancel_futures=False)
 
+    def _persist_pending_rollout_log(
+        self,
+        rollout_id: int,
+        pending: _PendingRolloutLog,
+    ) -> Path | None:
+        """Fsync speculative telemetry before its train data leaves the actor."""
+
+        paths = _rollout_metrics_journal_paths(self.args, rollout_id)
+        if paths is None:
+            return None
+        pending_path, emitted_path = paths
+        if (
+            pending.prepared_log_dict is None
+            and getattr(self.args, "custom_rollout_log_function_path", None) is None
+            and not getattr(self.args, "load_debug_rollout_data", False)
+        ):
+            pending.prepared_log_dict = _prepare_rollout_log_dict(
+                self.args,
+                pending.samples,
+                pending.extra_metrics,
+                pending.rollout_time,
+            )
+        # A rolled-back step may be generated again after a newer, uncheckpointed
+        # attempt logged it.  The new payload supersedes that old emitted marker.
+        try:
+            emitted_path.unlink()
+        except FileNotFoundError:
+            pass
+        journal_pending = pending
+        if pending.prepared_log_dict is not None:
+            # Default logging needs only this compact numeric payload.  Avoid
+            # retaining prompts, responses, and token arrays in every durable
+            # telemetry record.  Custom log hooks keep the original samples
+            # because their data dependencies are intentionally opaque.
+            journal_pending = _PendingRolloutLog(
+                samples=None,
+                extra_metrics=None,
+                rollout_time=pending.rollout_time,
+                prepared_log_dict=dict(pending.prepared_log_dict),
+            )
+        payload = {
+            "version": _ROLLOUT_METRICS_JOURNAL_VERSION,
+            "rollout_id": int(rollout_id),
+            "pending": journal_pending,
+        }
+        _atomic_torch_save(payload, pending_path)
+        return pending_path
+
+    def _mark_rollout_metrics_emitted(
+        self,
+        rollout_id: int,
+        pending_path: Path | None,
+    ) -> None:
+        if pending_path is None:
+            return
+        emitted_path = pending_path.with_suffix("").with_suffix(".emitted")
+        _mark_rollout_metrics_journal_emitted(
+            rollout_id,
+            pending_path,
+            emitted_path,
+        )
+
     def commit_rollout_metrics(self, rollout_id: int) -> None:
         """Emit metrics only after the driver confirms actor-train success."""
         pending = self._pending_rollout_logs.get(rollout_id)
         if pending is None:
             raise KeyError(f"no uncommitted rollout metrics for batch {rollout_id}")
-        _log_rollout_data(
-            rollout_id,
-            self.args,
-            pending.samples,
-            pending.extra_metrics,
-            pending.rollout_time,
-            completed_train_batch=True,
-        )
+        _emit_pending_rollout_log(rollout_id, self.args, pending)
+        pending_paths = getattr(self, "_pending_rollout_log_paths", {})
+        pending_path = pending_paths.get(rollout_id)
+        self._mark_rollout_metrics_emitted(rollout_id, pending_path)
         del self._pending_rollout_logs[rollout_id]
+        pending_paths.pop(rollout_id, None)
+
+    def acknowledge_rollout_metrics(self, rollout_id: int) -> None:
+        """Release actor memory after the driver committed its journal."""
+
+        pending = self._pending_rollout_logs.get(rollout_id)
+        if pending is None:
+            raise KeyError(f"no uncommitted rollout metrics for batch {rollout_id}")
+        pending_path = getattr(self, "_pending_rollout_log_paths", {}).get(
+            rollout_id
+        )
+        if pending_path is None:
+            raise RuntimeError(
+                f"rollout metrics for batch {rollout_id} have no durable journal"
+            )
+        emitted_path = pending_path.with_suffix("").with_suffix(".emitted")
+        if not emitted_path.is_file():
+            raise RuntimeError(
+                f"rollout metrics for batch {rollout_id} were not durably emitted"
+            )
+        del self._pending_rollout_logs[rollout_id]
+        self._pending_rollout_log_paths.pop(rollout_id, None)
+
+    def recover_rollout_metrics(self, checkpoint_rollout_id: int) -> list[int]:
+        """Replay telemetry whose successful train is proven by a checkpoint.
+
+        The model checkpoint tracker is the acceptance commit marker.  A
+        journal for a later speculative rollout is intentionally left pending
+        because that batch was not made resumable and will be generated again.
+        """
+
+        recovered: list[int] = []
+        if not hasattr(self, "_pending_rollout_log_paths"):
+            self._pending_rollout_log_paths = {}
+        roots = []
+        for candidate in (getattr(self.args, "load", None), getattr(self.args, "save", None)):
+            if candidate is not None and candidate not in roots:
+                roots.append(candidate)
+        for checkpoint_root in roots:
+            paths = _rollout_metrics_journal_paths(
+                self.args,
+                0,
+                checkpoint_root=checkpoint_root,
+            )
+            if paths is None:
+                continue
+            journal_dir = paths[0].parent
+            if not journal_dir.is_dir():
+                continue
+            for emitted_path in sorted(journal_dir.glob("rollout_*.emitted")):
+                stem = emitted_path.name.removeprefix("rollout_").removesuffix(
+                    ".emitted"
+                )
+                try:
+                    emitted_rollout_id = int(stem)
+                except ValueError as exc:
+                    raise RuntimeError(
+                        f"invalid rollout metrics marker filename: {emitted_path}"
+                    ) from exc
+                pending_path = emitted_path.with_suffix(".pending.pt")
+                if (
+                    emitted_rollout_id <= checkpoint_rollout_id
+                    and not pending_path.is_file()
+                ):
+                    raise FileNotFoundError(
+                        "rollout metrics emitted marker has no durable payload "
+                        f"for checkpointed batch {emitted_rollout_id}: {pending_path}"
+                    )
+            for pending_path in sorted(journal_dir.glob("rollout_*.pending.pt")):
+                stem = pending_path.name.removeprefix("rollout_").removesuffix(
+                    ".pending.pt"
+                )
+                try:
+                    rollout_id = int(stem)
+                except ValueError as exc:
+                    raise RuntimeError(
+                        f"invalid rollout metrics journal filename: {pending_path}"
+                    ) from exc
+                if rollout_id > checkpoint_rollout_id or rollout_id in recovered:
+                    continue
+                emitted_path = pending_path.with_suffix("").with_suffix(".emitted")
+                if emitted_path.exists():
+                    continue
+                pending = _load_rollout_metrics_journal(pending_path, rollout_id)
+                if rollout_id in self._pending_rollout_logs:
+                    raise RuntimeError(
+                        f"rollout metrics for batch {rollout_id} are already pending"
+                    )
+                self._pending_rollout_logs[rollout_id] = pending
+                self._pending_rollout_log_paths[rollout_id] = pending_path
+                logger.info(
+                    "Replaying crash-recovered rollout metrics for checkpoint %s",
+                    rollout_id,
+                )
+                self.commit_rollout_metrics(rollout_id)
+                recovered.append(rollout_id)
+        return recovered
 
     def eval(
         self,
@@ -1584,11 +1885,43 @@ def _log_rollout_data(
     if args.load_debug_rollout_data:
         return
 
+    log_dict = _prepare_rollout_log_dict(
+        args,
+        samples,
+        rollout_extra_metrics,
+        rollout_time,
+    )
+    _emit_rollout_log_dict(
+        rollout_id,
+        args,
+        log_dict,
+        completed_train_batch=completed_train_batch,
+    )
+
+
+def _prepare_rollout_log_dict(
+    args,
+    samples,
+    rollout_extra_metrics,
+    rollout_time,
+) -> dict[str, Any]:
+    """Compute the compact, journal-safe business/performance payload."""
+
     log_dict = {**(rollout_extra_metrics or {})}
     log_dict |= dict_add_prefix(compute_metrics_from_samples(args, samples), "rollout/")
     perf_time = _resolve_rollout_perf_time(rollout_extra_metrics, rollout_time)
     log_dict |= _prefix_rollout_performance_metrics(compute_perf_metrics_from_samples(args, samples, perf_time))
     log_dict["timing/handoff_time"] = rollout_time
+    return log_dict
+
+
+def _emit_rollout_log_dict(
+    rollout_id: int,
+    args,
+    log_dict: dict[str, Any],
+    *,
+    completed_train_batch: bool,
+) -> None:
     logger.info(f"perf {rollout_id}: {log_dict}")
     step_key = set_wandb_step(
         args,
@@ -1598,6 +1931,29 @@ def _log_rollout_data(
         completed_train_batch=completed_train_batch,
     )
     logging_utils.log(args, log_dict, step_key=step_key)
+
+
+def _emit_pending_rollout_log(
+    rollout_id: int,
+    args,
+    pending: _PendingRolloutLog,
+) -> None:
+    if pending.prepared_log_dict is not None:
+        _emit_rollout_log_dict(
+            rollout_id,
+            args,
+            dict(pending.prepared_log_dict),
+            completed_train_batch=True,
+        )
+        return
+    _log_rollout_data(
+        rollout_id,
+        args,
+        pending.samples,
+        pending.extra_metrics,
+        pending.rollout_time,
+        completed_train_batch=True,
+    )
 
 
 def _resolve_rollout_perf_time(rollout_extra_metrics, handoff_time):
