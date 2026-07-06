@@ -16,6 +16,21 @@ class _RemoteMethod:
         return self._func(*args, **kwargs)
 
 
+class _QueuedActorRef:
+    """Small ObjectRef stand-in for ordered RolloutManager actor calls."""
+
+    def __init__(self, func):
+        self._func = func
+        self.resolved = False
+        self.value = None
+
+    def resolve(self):
+        if not self.resolved:
+            self.value = self._func()
+            self.resolved = True
+        return self.value
+
+
 class _RolloutManager:
     def __init__(self, events):
         self.ready = _RemoteMethod(
@@ -63,6 +78,44 @@ class _RolloutManager:
             lambda action: events.append(("check-weights", action))
         )
         self.dispose = _RemoteMethod(lambda: events.append(("dispose", None)))
+
+
+class _OrderedRolloutManager(_RolloutManager):
+    """Model Ray's single ordered actor closely enough to expose queue stalls."""
+
+    def __init__(self, events):
+        super().__init__(events)
+        self._events = events
+        self._queue = []
+        self.generate = _RemoteMethod(self._submit_generate)
+        self.commit_rollout_metrics = _RemoteMethod(self._submit_metrics_commit)
+
+    def _submit_generate(self, rollout_id):
+        self._events.append(("generate-submit", rollout_id))
+        ref = _QueuedActorRef(
+            lambda: (
+                self._events.append(("generate-finish", rollout_id))
+                or f"data-{rollout_id}"
+            )
+        )
+        self._queue.append(ref)
+        return ref
+
+    def _submit_metrics_commit(self, rollout_id):
+        self._events.append(("metrics-commit-submit", rollout_id))
+        ref = _QueuedActorRef(
+            lambda: self._events.append(("metrics-commit", rollout_id))
+        )
+        self._queue.append(ref)
+        return ref
+
+    def get(self, value, **_kwargs):
+        if not isinstance(value, _QueuedActorRef):
+            return value
+        while not value.resolved:
+            assert self._queue, "target ref is absent from the actor queue"
+            self._queue.pop(0).resolve()
+        return value.value
 
 
 class _ActorModel:
@@ -170,11 +223,11 @@ def test_rollout_state_precedes_training_and_model_commit(monkeypatch, tmp_path)
     assert names.index("trainer-init") < names.index("trainer-rollout-wire")
     assert names.index("generate") < names.index("state-save")
     assert names.index("state-save") < names.index("train")
-    assert names.index("train") < names.index("pretrain-eval-wait")
+    assert names.index("train") < names.index("model-save")
+    assert names.index("model-save") < names.index("pretrain-eval-wait")
     assert names.index("pretrain-eval-wait") < names.index("metrics-commit")
     assert names.index("train") < names.index("metrics-commit")
-    assert names.index("metrics-commit") < names.index("model-save")
-    assert names.index("train") < names.index("model-save")
+    assert ("model-save", 0, True) in events
     assert [event for event in events if event[0] == "weights"] == [
         ("weights", None),
         ("weights", 0),
@@ -204,6 +257,52 @@ def test_rollout_state_precedes_training_and_model_commit(monkeypatch, tmp_path)
     assert names.index("final-eval-marker") < names.index("training-marker")
     assert ("eval-require-complete", 0, True) in events
     assert ("rollout-manager-wait-ready", False) in events
+
+
+def test_periodic_checkpoint_commits_before_waiting_for_ordered_prefetch(
+    monkeypatch, tmp_path
+):
+    events = []
+    rollout_manager = _OrderedRolloutManager(events)
+    actor_model = _ActorModel(events)
+    args = _resume_args(
+        tmp_path,
+        start_rollout_id=0,
+        num_rollout=2,
+        training_complete_marker=None,
+        final_eval_complete_marker=None,
+        eval_interval=None,
+        concurrent_pretrain_eval=False,
+        save_interval=1,
+        rollout_global_dataset=True,
+        update_weights_interval=10,
+    )
+    _patch_resume_runtime(
+        monkeypatch,
+        events,
+        rollout_manager,
+        actor_model,
+        num_rollout_per_epoch=None,
+    )
+    monkeypatch.setattr(train_async.ray, "get", rollout_manager.get)
+
+    train_async.train(args)
+
+    # Snapshot N is durable before speculative generation can advance the
+    # data source, then generation N+1 overlaps actor train/checkpoint N.
+    assert events.index(("state-save", 0)) < events.index(("generate-submit", 1))
+    assert events.index(("generate-submit", 1)) < events.index(("train", 0))
+    assert events.index(("train", 0)) < events.index(("model-save", 0, True))
+
+    # Resolving the metrics call must first drain the already-enqueued long
+    # generate(1).  The synchronous model save therefore proves checkpoint 0
+    # commits without waiting behind that RolloutManager queue.
+    assert events.index(("model-save", 0, True)) < events.index(
+        ("generate-finish", 1)
+    )
+    assert events.index(("generate-finish", 1)) < events.index(
+        ("metrics-commit", 0)
+    )
 
 
 def _resume_args(tmp_path, **overrides):
