@@ -74,6 +74,14 @@ class _RolloutManager:
         self.commit_rollout_metrics = _RemoteMethod(
             lambda rollout_id: events.append(("metrics-commit", rollout_id))
         )
+        self.recover_rollout_metrics = _RemoteMethod(
+            lambda checkpoint_rollout_id: (
+                events.append(("metrics-recover", checkpoint_rollout_id)) or []
+            )
+        )
+        self.acknowledge_rollout_metrics = _RemoteMethod(
+            lambda rollout_id: events.append(("metrics-ack", rollout_id))
+        )
         self.check_weights = _RemoteMethod(
             lambda action: events.append(("check-weights", action))
         )
@@ -89,6 +97,7 @@ class _OrderedRolloutManager(_RolloutManager):
         self._queue = []
         self.generate = _RemoteMethod(self._submit_generate)
         self.commit_rollout_metrics = _RemoteMethod(self._submit_metrics_commit)
+        self.acknowledge_rollout_metrics = _RemoteMethod(self._submit_metrics_ack)
 
     def _submit_generate(self, rollout_id):
         self._events.append(("generate-submit", rollout_id))
@@ -105,6 +114,14 @@ class _OrderedRolloutManager(_RolloutManager):
         self._events.append(("metrics-commit-submit", rollout_id))
         ref = _QueuedActorRef(
             lambda: self._events.append(("metrics-commit", rollout_id))
+        )
+        self._queue.append(ref)
+        return ref
+
+    def _submit_metrics_ack(self, rollout_id):
+        self._events.append(("metrics-ack-submit", rollout_id))
+        ref = _QueuedActorRef(
+            lambda: self._events.append(("metrics-ack", rollout_id))
         )
         self._queue.append(ref)
         return ref
@@ -221,6 +238,8 @@ def test_rollout_state_precedes_training_and_model_commit(monkeypatch, tmp_path)
     names = [event[0] for event in events]
     assert names.index("ready-submit") < names.index("trainer-init")
     assert names.index("trainer-init") < names.index("trainer-rollout-wire")
+    assert ("metrics-recover", -1) in events
+    assert names.index("metrics-recover") < names.index("generate")
     assert names.index("generate") < names.index("state-save")
     assert names.index("state-save") < names.index("train")
     assert names.index("train") < names.index("model-save")
@@ -285,6 +304,13 @@ def test_periodic_checkpoint_commits_before_waiting_for_ordered_prefetch(
         num_rollout_per_epoch=None,
     )
     monkeypatch.setattr(train_async.ray, "get", rollout_manager.get)
+    monkeypatch.setattr(
+        train_async,
+        "commit_rollout_metrics_from_journal",
+        lambda _args, rollout_id: (
+            events.append(("journal-commit", rollout_id)) or True
+        ),
+    )
 
     train_async.train(args)
 
@@ -294,15 +320,19 @@ def test_periodic_checkpoint_commits_before_waiting_for_ordered_prefetch(
     assert events.index(("generate-submit", 1)) < events.index(("train", 0))
     assert events.index(("train", 0)) < events.index(("model-save", 0, True))
 
-    # Resolving the metrics call must first drain the already-enqueued long
-    # generate(1).  The synchronous model save therefore proves checkpoint 0
-    # commits without waiting behind that RolloutManager queue.
+    # Both the model tracker and journal telemetry commit before the
+    # already-enqueued long generate(1).  Only the memory-release
+    # acknowledgement remains ordered behind generation on the actor.
     assert events.index(("model-save", 0, True)) < events.index(
+        ("journal-commit", 0)
+    )
+    assert events.index(("journal-commit", 0)) < events.index(
         ("generate-finish", 1)
     )
     assert events.index(("generate-finish", 1)) < events.index(
-        ("metrics-commit", 0)
+        ("metrics-ack", 0)
     )
+    assert ("metrics-commit", 0) not in events
 
 
 def _resume_args(tmp_path, **overrides):
