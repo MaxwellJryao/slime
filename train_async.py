@@ -382,6 +382,24 @@ def train(args):
         else:
             ray.get(actor_model.async_train(rollout_id, rollout_data_curr_ref))
 
+        graceful_exit = graceful_exit_due(graceful_exit_deadline)
+        if save_due or graceful_exit:
+            # RolloutManager is a single ordered actor.  The speculative
+            # generate(N+1) submitted above can therefore sit in front of
+            # wait_pretrain_eval/commit_rollout_metrics for minutes.  Commit
+            # checkpoint N before either of those calls so a long prefetch
+            # cannot delay persistence of the successfully trained batch.
+            #
+            # The matching data-source snapshot was fsynced before prefetch
+            # submission.  Force completion even with --async-save so the
+            # model tracker is a durable commit marker when this block
+            # returns.  Checkpoint I/O still overlaps generate(N+1), which is
+            # already running on the disjoint rollout resources.
+            if (not args.use_critic) or rollout_id >= args.num_critic_only_steps:
+                actor_model.save_model(rollout_id, force_sync=True)
+            if args.use_critic:
+                critic_model.save_model(rollout_id, force_sync=True)
+
         if pretrain_eval_due and getattr(args, "concurrent_pretrain_eval", False):
             # Rollout 0 no longer waits for the long tail of the fixed
             # baseline, so the first actor step can use otherwise-idle trainer
@@ -394,19 +412,6 @@ def train(args):
         # consumed successfully by the actor.  Commit its reward/service/perf
         # metrics here so an untrained speculative batch never reaches W&B.
         ray.get(rollout_manager.commit_rollout_metrics.remote(rollout_id))
-
-        graceful_exit = graceful_exit_due(graceful_exit_deadline)
-        if save_due or graceful_exit:
-            if (not args.use_critic) or rollout_id >= args.num_critic_only_steps:
-                actor_model.save_model(
-                    rollout_id,
-                    force_sync=graceful_exit or rollout_id == args.num_rollout - 1,
-                )
-            if args.use_critic:
-                critic_model.save_model(
-                    rollout_id,
-                    force_sync=graceful_exit or rollout_id == args.num_rollout - 1,
-                )
 
         if graceful_exit:
             completed_all_rollouts = False
