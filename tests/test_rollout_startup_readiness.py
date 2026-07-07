@@ -173,5 +173,74 @@ def test_rollout_manager_ready_waits_and_starts_health_monitors_once(
     assert manager._ci_fault_injection_pending is True
 
 
+@pytest.mark.unit
+def test_start_rollout_id_sync_is_idempotent_and_pre_generation_only() -> None:
+    manager_cls = rollout.RolloutManager.__ray_metadata__.modified_class
+    manager = object.__new__(manager_cls)
+    manager.args = SimpleNamespace(start_rollout_id=None)
+    manager.rollout_id = -1
+
+    assert manager_cls.set_start_rollout_id(manager, 7) == 7
+    assert manager.args.start_rollout_id == 7
+    assert manager_cls.set_start_rollout_id(manager, 7) == 7
+
+    with pytest.raises(RuntimeError, match="conflicts with the trainer checkpoint"):
+        manager_cls.set_start_rollout_id(manager, 8)
+    with pytest.raises(ValueError, match="must be non-negative"):
+        manager_cls.set_start_rollout_id(manager, -1)
+
+    manager.rollout_id = 7
+    with pytest.raises(RuntimeError, match="after rollout generation starts"):
+        manager_cls.set_start_rollout_id(manager, 7)
+
+
+@pytest.mark.unit
+def test_connect_syncs_checkpoint_cursor_before_dataset_load(monkeypatch) -> None:
+    events: list[tuple[str, object]] = []
+    manager_cls = rollout.RolloutManager.__ray_metadata__.modified_class
+    actor_manager = object.__new__(manager_cls)
+    actor_manager.args = SimpleNamespace(start_rollout_id=None)
+    actor_manager.rollout_id = -1
+
+    class _Manager:
+        def __init__(self) -> None:
+            self.set_start_rollout_id = _RemoteMethod(self._sync)
+            self.load = _RemoteMethod(self._load)
+
+        def _sync(self, rollout_id: int) -> int:
+            events.append(("sync", rollout_id))
+            return manager_cls.set_start_rollout_id(actor_manager, rollout_id)
+
+        def _load(self, checkpoint_id: int) -> None:
+            assert actor_manager.args.start_rollout_id == checkpoint_id + 1
+            events.append(("load", checkpoint_id))
+
+    class _Actor:
+        def set_rollout_manager(self, manager) -> None:
+            events.append(("wire", manager))
+
+    manager = _Manager()
+    args = SimpleNamespace(
+        rollout_global_dataset=True,
+        start_rollout_id=7,
+        use_critic=False,
+    )
+    monkeypatch.setattr(placement_group.ray, "get", lambda value: value)
+
+    placement_group.connect_training_models_to_rollout(
+        args,
+        _Actor(),
+        None,
+        manager,
+    )
+
+    assert events == [
+        ("sync", 7),
+        ("wire", manager),
+        ("load", 6),
+    ]
+    assert actor_manager.args.start_rollout_id == 7
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))

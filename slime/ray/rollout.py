@@ -679,6 +679,35 @@ class RolloutManager:
             "timing/startup_rollout_manager_remote_init_time": (time.perf_counter() - remote_init_started_at),
         }
 
+    def set_start_rollout_id(self, start_rollout_id: int) -> int:
+        """Synchronize the checkpoint-derived rollout cursor before generation.
+
+        ``RolloutManager`` is constructed before trainer checkpoint loading so
+        rollout-engine and trainer initialization can overlap. Ray therefore
+        serializes an args snapshot whose ``start_rollout_id`` can still be
+        ``None``. The driver learns the durable cursor from the trainer later;
+        copy that derived value into the actor before loading rollout data or
+        generating the first resumed batch.
+        """
+
+        normalized = int(start_rollout_id)
+        if normalized < 0:
+            raise ValueError("start_rollout_id must be non-negative")
+        if self.rollout_id != -1:
+            raise RuntimeError(
+                "start_rollout_id cannot be changed after rollout generation starts"
+            )
+
+        current = getattr(self.args, "start_rollout_id", None)
+        if current is not None and int(current) != normalized:
+            raise RuntimeError(
+                "RolloutManager start_rollout_id conflicts with the trainer checkpoint: "
+                f"actor={int(current)}, trainer={normalized}"
+            )
+        self.args.start_rollout_id = normalized
+        logger.info("Synchronized RolloutManager start_rollout_id=%d", normalized)
+        return normalized
+
     def ready(self) -> dict[str, float]:
         """Wait once for every engine health check and router registration."""
 

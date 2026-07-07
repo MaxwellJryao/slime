@@ -157,6 +157,22 @@ def connect_training_models_to_rollout(
 ):
     """Wire initialized trainers to rollout state after both sides are ready."""
 
+    if args.rollout_global_dataset:
+        # RolloutManager is created before trainer checkpoint loading so the
+        # two model sets can initialize in parallel. Its serialized args can
+        # therefore still contain start_rollout_id=None. Synchronize the
+        # checkpoint-derived cursor before data-source load or first generate;
+        # partial-rollout replay uses this value to open the correct WAL and
+        # deduplicate reservation ids already committed by the checkpoint.
+        synchronized_start = ray.get(
+            rollout_manager.set_start_rollout_id.remote(args.start_rollout_id)
+        )
+        if int(synchronized_start) != int(args.start_rollout_id):
+            raise RuntimeError(
+                "RolloutManager returned a mismatched start_rollout_id: "
+                f"actor={synchronized_start}, trainer={args.start_rollout_id}"
+            )
+
     actor_model.set_rollout_manager(rollout_manager)
     if args.use_critic:
         critic_model.set_rollout_manager(rollout_manager)
