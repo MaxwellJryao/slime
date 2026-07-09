@@ -58,6 +58,9 @@ def enforce_train_rollout_logprob_abs_diff(
     # agent traces and is supported by both NCCL and Gloo.
     stats = torch.zeros(4, dtype=torch.float64, device=device)
     local_detail = ""
+    # Per-sample (diff_sum, mask_sum) tensors, materialized only on failure so
+    # the offending samples can be identified without a reproduction run.
+    per_sample_stats: list[tuple[int, torch.Tensor, torch.Tensor]] = []
 
     if mpu.is_pipeline_last_stage(ignore_virtual=True):
         train_log_probs = rollout_data.get("log_probs")
@@ -104,8 +107,11 @@ def enforce_train_rollout_logprob_abs_diff(
                     finite = torch.isfinite(diff)
                     stats[3] += (selected & ~finite).sum().to(dtype=torch.float64, device=device)
                     safe_diff = torch.where(finite, diff, torch.zeros_like(diff))
-                    stats[0] += (safe_diff * mask).sum().to(dtype=torch.float64, device=device)
-                    stats[1] += mask.sum().to(dtype=torch.float64, device=device)
+                    sample_diff_sum = (safe_diff * mask).sum().to(dtype=torch.float64, device=device)
+                    sample_mask_sum = mask.sum().to(dtype=torch.float64, device=device)
+                    stats[0] += sample_diff_sum
+                    stats[1] += sample_mask_sum
+                    per_sample_stats.append((sample_index, sample_diff_sum, sample_mask_sum))
 
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(stats, op=dist.ReduceOp.SUM)
@@ -123,6 +129,7 @@ def enforce_train_rollout_logprob_abs_diff(
 
     mean_abs_diff = stats[0].item() / mask_weight
     if mean_abs_diff > threshold:
+        _log_guard_failure_diagnostics(rollout_data, per_sample_stats)
         raise RuntimeError(
             "trainer/rollout log-probability mismatch exceeded the fail-fast threshold before backward: "
             f"rollout_id={rollout_id}, masked_mean_abs_diff={mean_abs_diff:.6g}, "
@@ -131,3 +138,66 @@ def enforce_train_rollout_logprob_abs_diff(
             "raise the explicit threshold only after verifying that lag is expected."
         )
     return mean_abs_diff
+
+
+def _log_guard_failure_diagnostics(
+    rollout_data: RolloutBatch,
+    per_sample_stats: list[tuple[int, torch.Tensor, torch.Tensor]],
+) -> None:
+    """Print per-sample mismatch structure so one failure localizes the bug.
+
+    The failure signature distinguishes the three plausible mechanisms:
+    a near-constant large diff on every sample points at the trainer forward
+    (weights/kernels/environment); a bimodal fine-vs-huge split points at
+    cross-sample pairing; large diffs concentrated at sequence starts point
+    at a response-window offset.
+    """
+
+    try:
+        rows = []
+        for sample_index, diff_sum, mask_sum in per_sample_stats:
+            weight = mask_sum.item()
+            if weight <= 0:
+                continue
+            rows.append((diff_sum.item() / weight, sample_index, int(weight)))
+        if not rows:
+            return
+        rows.sort(reverse=True)
+        train_log_probs = rollout_data.get("log_probs")
+        rollout_log_probs = rollout_data.get("rollout_log_probs")
+        total_lengths = rollout_data.get("total_lengths")
+        response_lengths = rollout_data.get("response_lengths")
+        header = [
+            "trainer/rollout logprob guard failure diagnostics "
+            f"(rank-local samples={len(rows)}):"
+        ]
+        per_sample_means = sorted(mean for mean, _, _ in rows)
+        header.append(
+            f"per-sample masked mean |diff|: min={per_sample_means[0]:.4g} "
+            f"p50={per_sample_means[len(per_sample_means) // 2]:.4g} "
+            f"max={per_sample_means[-1]:.4g}; samples over 1.0: "
+            f"{sum(1 for m in per_sample_means if m > 1.0)}/{len(per_sample_means)}"
+        )
+        for label, selected in (("worst", rows[:4]), ("best", rows[-2:])):
+            for mean, sample_index, weight in selected:
+                total_length = int(total_lengths[sample_index]) if total_lengths is not None else -1
+                response_length = (
+                    int(response_lengths[sample_index]) if response_lengths is not None else -1
+                )
+                train_head = [
+                    round(float(value), 4)
+                    for value in train_log_probs[sample_index].flatten()[:6].tolist()
+                ]
+                rollout_head = [
+                    round(float(value), 4)
+                    for value in rollout_log_probs[sample_index].flatten()[:6].tolist()
+                ]
+                header.append(
+                    f"  {label} sample={sample_index} mean|diff|={mean:.4g} "
+                    f"masked_tokens={weight} total_len={total_length} "
+                    f"resp_len={response_length} train_lp_head={train_head} "
+                    f"rollout_lp_head={rollout_head}"
+                )
+        print("\n".join(header), flush=True)
+    except Exception as diag_exc:  # pragma: no cover - diagnostics must not mask the raise
+        print(f"logprob guard diagnostics failed: {diag_exc!r}", flush=True)
