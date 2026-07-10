@@ -913,6 +913,29 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "as `--hf-checkpoint`. "
                 ),
             )
+            parser.add_argument(
+                "--save-hf-add-missing-from-origin",
+                action="store_true",
+                default=False,
+                help=(
+                    "When saving with --save-hf in raw Megatron-to-HF mode, copy tensors that exist "
+                    "in the --hf-checkpoint origin but are absent from the trained export (e.g. the "
+                    "frozen vision tower of a VLM-container checkpoint trained text-only), so the "
+                    "saved directory is a complete, standalone-loadable HF checkpoint."
+                ),
+            )
+            parser.add_argument(
+                "--no-save-megatron",
+                action="store_true",
+                default=False,
+                help=(
+                    "If set, skip the Megatron torch_dist checkpoint (weights + optimizer state, "
+                    "roughly 10x the size of the HuggingFace export) at each save and only write "
+                    "the `--save-hf` export. The run then has no exact resume point: a restarted "
+                    "allocation falls back to the seed checkpoint instead of continuing from the "
+                    "latest rollout. Requires --save-hf."
+                ),
+            )
             reset_arg(parser, "--seed", type=int, default=1234)
             reset_arg(parser, "--clip-grad", type=float, default=1.0)
             reset_arg(parser, "--calculate-per-token-loss", action="store_true")
@@ -1973,6 +1996,23 @@ def slime_validate_args(args):
         assert args.save is not None, "'--save' is required when save_interval is set."
     if getattr(args, "graceful_exit_at_unix_time", None) is not None:
         assert args.save is not None, "'--save' is required when graceful exit is enabled."
+    if getattr(args, "save_hf", None) is not None:
+        # Fail at parse time, not at the first save, when the export cannot work:
+        # by then a --no-save-megatron run would have persisted nothing at all.
+        try:
+            args.save_hf.format(rollout_id=0)
+        except (KeyError, IndexError, ValueError) as e:
+            raise AssertionError(f"--save-hf template {args.save_hf!r} does not format with rollout_id: {e}") from e
+        if args.megatron_to_hf_mode == "raw":
+            assert args.hf_checkpoint is not None and os.path.isdir(args.hf_checkpoint), (
+                "--save-hf in raw Megatron-to-HF mode copies tokenizer/config assets from --hf-checkpoint, "
+                f"which must be a local directory: {args.hf_checkpoint!r}"
+            )
+    if getattr(args, "no_save_megatron", False):
+        assert args.save_hf is not None, (
+            "'--no-save-megatron' skips the torch_dist checkpoint, so '--save-hf' is required "
+            "or nothing would be persisted at save time."
+        )
 
     assert not (args.kl_coef != 0 and args.kl_loss_coef != 0), "Only one of kl_coef and kl_loss_coef can be set"
 

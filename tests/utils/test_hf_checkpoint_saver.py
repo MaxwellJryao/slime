@@ -7,7 +7,6 @@ import torch
 from safetensors.torch import load_file
 
 from slime.backends.megatron_utils.hf_checkpoint_saver import (
-    _clear_existing_hf_weights,
     _copy_hf_assets,
     _finalize_shard_files,
     _SafetensorShardWriter,
@@ -38,20 +37,6 @@ def test_copy_hf_assets_keeps_quantized_config_and_skips_weights(tmp_path: Path)
     assert not (dst / "model.safetensors.index.json").exists()
     assert not (dst / "model-00001-of-00001.safetensors").exists()
     assert not (dst / "pytorch_model.bin").exists()
-
-
-def test_clear_existing_hf_weights_removes_old_weight_files_only(tmp_path: Path):
-    (tmp_path / "config.json").write_text("{}", encoding="utf-8")
-    (tmp_path / "model.safetensors.index.json").write_text("{}", encoding="utf-8")
-    (tmp_path / "model-00001-of-00001.safetensors").write_bytes(b"weight")
-    (tmp_path / "pytorch_model.bin").write_bytes(b"weight")
-
-    _clear_existing_hf_weights(tmp_path)
-
-    assert (tmp_path / "config.json").exists()
-    assert not (tmp_path / "model.safetensors.index.json").exists()
-    assert not (tmp_path / "model-00001-of-00001.safetensors").exists()
-    assert not (tmp_path / "pytorch_model.bin").exists()
 
 
 def test_save_hf_model_direct_to_path_rejects_origin_checkpoint(tmp_path: Path):

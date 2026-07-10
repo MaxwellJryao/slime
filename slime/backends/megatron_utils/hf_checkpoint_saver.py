@@ -61,6 +61,12 @@ def save_hf_model_direct_to_path(
         raise ValueError(
             f"--hf-checkpoint must be a local directory when saving raw HuggingFace weights: {args.hf_checkpoint}"
         )
+    # Shards are written to a sibling staging directory and published with a
+    # rename once the index and completion marker exist, so a crash mid-export
+    # can never leave a partially written directory at the final path.
+    staging = path.with_name(path.name + ".tmp-save")
+    if hf_checkpoint == staging.resolve():
+        raise ValueError("HF save staging path must not point to the same directory as --hf-checkpoint")
 
     import torch.distributed as dist
     from transformers import AutoConfig
@@ -74,9 +80,10 @@ def save_hf_model_direct_to_path(
     if is_save_rank:
         try:
             logger.info("Saving model in HuggingFace format to %s with raw Megatron-to-HF conversion", path)
-            path.mkdir(parents=True, exist_ok=True)
-            _clear_existing_hf_weights(path)
-            _copy_hf_assets(args.hf_checkpoint, path)
+            if staging.exists():
+                shutil.rmtree(staging)
+            staging.mkdir(parents=True)
+            _copy_hf_assets(args.hf_checkpoint, staging)
         except Exception as e:
             setup_error = repr(e)
 
@@ -119,7 +126,7 @@ def save_hf_model_direct_to_path(
             writer_ranks,
         )
 
-    writer = _SafetensorShardWriter(path, enabled=is_writer_rank)
+    writer = _SafetensorShardWriter(staging, enabled=is_writer_rank)
     pending_write = None
 
     for chunk_idx, hf_named_tensors in enumerate(
@@ -135,7 +142,12 @@ def save_hf_model_direct_to_path(
             pending_write = _write_pending_chunk(writer, pending_write)
 
     pending_write = _write_pending_chunk(writer, pending_write)
-    _finalize_distributed_shards(path, writer.state())
+    fill_from_origin_dir = (
+        hf_checkpoint if getattr(args, "save_hf_add_missing_from_origin", False) else None
+    )
+    _finalize_distributed_shards(
+        staging, writer.state(), fill_from_origin_dir=fill_from_origin_dir, publish_to=path
+    )
 
     if is_save_rank:
         logger.info("Successfully saved HuggingFace model to %s", path)
@@ -252,7 +264,13 @@ def _write_pending_chunk(
     return None
 
 
-def _finalize_distributed_shards(path: Path, local_state: dict[str, Any]) -> None:
+def _finalize_distributed_shards(
+    staging: Path,
+    local_state: dict[str, Any],
+    *,
+    fill_from_origin_dir: Path | None = None,
+    publish_to: Path | None = None,
+) -> None:
     import torch.distributed as dist
 
     if dist.is_available() and dist.is_initialized():
@@ -261,14 +279,113 @@ def _finalize_distributed_shards(path: Path, local_state: dict[str, Any]) -> Non
     else:
         states = [local_state]
 
+    finalize_error = None
     if _is_global_rank_zero():
-        _finalize_shard_files(path, states)
+        try:
+            if fill_from_origin_dir is not None:
+                saved_weight_map: dict[str, str] = {}
+                for state in states:
+                    if state:
+                        saved_weight_map.update(state.get("weight_map", {}))
+                states = list(states) + _copy_missing_weights_from_origin(
+                    staging, Path(fill_from_origin_dir), saved_weight_map
+                )
+            index_data = _finalize_shard_files(staging, states)
+            _write_export_complete_marker(staging, index_data, fill_from_origin_dir)
+            if publish_to is not None:
+                if publish_to.exists():
+                    shutil.rmtree(publish_to)
+                os.replace(staging, publish_to)
+        except Exception as e:
+            finalize_error = repr(e)
 
-    if dist.is_available() and dist.is_initialized():
-        dist.barrier()
+    # Broadcast instead of a bare barrier so a rank-0-only failure raises on
+    # every rank rather than stranding the others until the collective times out.
+    _raise_if_rank_zero_failed("finalize HuggingFace export", finalize_error)
 
 
-def _finalize_shard_files(path: Path, shard_states: list[dict[str, Any] | None]) -> None:
+def _write_export_complete_marker(
+    staging: Path, index_data: dict[str, Any], fill_from_origin_dir: Path | None
+) -> None:
+    from datetime import datetime, timezone
+
+    weight_map = index_data["weight_map"]
+    manifest = {
+        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "source": "slime --save-hf",
+        "origin_hf_dir": str(fill_from_origin_dir) if fill_from_origin_dir is not None else None,
+        "weight_key_count": len(weight_map),
+        "weight_shard_count": len(set(weight_map.values())),
+        "weight_bytes": index_data["metadata"]["total_size"],
+    }
+    (staging / ".export_complete.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+
+
+def _origin_weight_locations(origin: Path) -> dict[str, str]:
+    index_path = origin / "model.safetensors.index.json"
+    if index_path.is_file():
+        with open(index_path, encoding="utf-8") as f:
+            return json.load(f)["weight_map"]
+    single_file = origin / "model.safetensors"
+    if single_file.is_file():
+        from safetensors import safe_open
+
+        with safe_open(single_file, framework="pt", device="cpu") as f:
+            return {name: single_file.name for name in f.keys()}
+    raise ValueError(f"origin HF checkpoint has no safetensors weights to fill from: {origin}")
+
+
+def _copy_missing_weights_from_origin(
+    path: Path, origin: Path, saved_weight_map: dict[str, str]
+) -> list[dict[str, Any]]:
+    """Copy origin tensors absent from the trained export (e.g. frozen vision towers).
+
+    The Megatron trainer only holds the trained backbone, so a VLM-container
+    checkpoint would otherwise be saved without its untrained weights and could
+    not be loaded standalone. Tensors are streamed shard-by-shard to bound
+    memory. Returns writer-state dicts to merge into shard finalization.
+    """
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+
+    missing_by_shard: dict[str, list[str]] = {}
+    for name, shard in _origin_weight_locations(origin).items():
+        if name not in saved_weight_map:
+            missing_by_shard.setdefault(shard, []).append(name)
+    if not missing_by_shard:
+        return []
+
+    missing_names = sorted(name for names in missing_by_shard.values() for name in names)
+    logger.info(
+        "Copying %d origin HF tensor(s) missing from the trained export (e.g. %s)",
+        len(missing_names),
+        ", ".join(missing_names[:3]),
+    )
+
+    states: list[dict[str, Any]] = []
+    for shard_idx, shard in enumerate(sorted(missing_by_shard)):
+        state_dict = {}
+        total_size = 0
+        with safe_open(origin / shard, framework="pt", device="cpu") as f:
+            for name in missing_by_shard[shard]:
+                tensor = f.get_tensor(name)
+                total_size += tensor.numel() * tensor.element_size()
+                state_dict[name] = tensor
+        filename = f"model-origin-{shard_idx + 1:05d}.safetensors"
+        if (path / filename).exists():
+            raise ValueError(f"Duplicate HF shard file while filling from origin: {filename}")
+        save_file(state_dict, path / filename, metadata={"format": "pt"})
+        states.append(
+            {
+                "total_size": total_size,
+                "weight_map": {name: filename for name in state_dict},
+                "shard_files": [filename],
+            }
+        )
+    return states
+
+
+def _finalize_shard_files(path: Path, shard_states: list[dict[str, Any] | None]) -> dict[str, Any]:
     shard_files = []
     total_size = 0
     raw_weight_map = {}
@@ -308,6 +425,7 @@ def _finalize_shard_files(path: Path, shard_states: list[dict[str, Any] | None])
     index_data = {"metadata": {"total_size": total_size}, "weight_map": final_weight_map}
     with open(path / "model.safetensors.index.json", "w", encoding="utf-8") as f:
         json.dump(index_data, f, indent=2)
+    return index_data
 
 
 def _shard_filename_sort_key(filename: str) -> tuple[float, str]:
@@ -327,12 +445,6 @@ def _tensor_for_safetensors(tensor: torch.Tensor) -> torch.Tensor:
     if tensor.device.type != "cpu":
         tensor = tensor.cpu()
     return tensor
-
-
-def _clear_existing_hf_weights(path: Path) -> None:
-    for item in path.iterdir():
-        if item.is_file() and _is_hf_weight_file(item):
-            item.unlink()
 
 
 def _copy_hf_assets(origin_hf_dir: str, output_dir: Path) -> None:

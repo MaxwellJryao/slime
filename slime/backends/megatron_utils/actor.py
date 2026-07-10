@@ -587,15 +587,19 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.offload_train:
             self.wake_up()
 
-        if self.args.async_save:
-            from megatron.training.async_utils import maybe_finalize_async_save
+        if self.args.no_save_megatron:
+            if is_megatron_main_rank():
+                logger.info(f"Skipping Megatron torch_dist checkpoint at rollout_id {rollout_id} (--no-save-megatron)")
+        else:
+            if self.args.async_save:
+                from megatron.training.async_utils import maybe_finalize_async_save
 
-            maybe_finalize_async_save(blocking=True)
+                maybe_finalize_async_save(blocking=True)
 
-        save(rollout_id, self.model, self.optimizer, self.opt_param_scheduler)
+            save(rollout_id, self.model, self.optimizer, self.opt_param_scheduler)
 
-        if force_sync and self.args.async_save:
-            maybe_finalize_async_save(blocking=True)
+            if force_sync and self.args.async_save:
+                maybe_finalize_async_save(blocking=True)
 
         if self.args.save_hf is not None and self.role == "actor":
             save_hf_model_to_path(self.args, Path(self.args.save_hf.format(rollout_id=rollout_id)), self.model)
