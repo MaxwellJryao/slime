@@ -85,6 +85,10 @@ class _RolloutManager:
         self.check_weights = _RemoteMethod(
             lambda action: events.append(("check-weights", action))
         )
+        # The default fake models a rollout function with no optional
+        # weight-update lifecycle hooks.
+        self.pause_generation_for_weight_update = _RemoteMethod(lambda: False)
+        self.resume_generation_after_weight_update = _RemoteMethod(lambda: False)
         self.dispose = _RemoteMethod(lambda: events.append(("dispose", None)))
 
 

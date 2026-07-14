@@ -635,6 +635,13 @@ class RolloutManager:
 
         self.generate_rollout = load_function(self.args.rollout_function_path)
         self.eval_generate_rollout = load_function(self.args.eval_function_path)
+        # Optional custom-rollout lifecycle around actor -> serving weight
+        # updates.  A persistent/fully-async rollout implementation can keep
+        # issuing model requests after generate() has returned, so the driver
+        # needs a stronger boundary than waiting for the top-level Ray future.
+        # The custom function owns the mechanism (for example, freeze + drain
+        # an inference proxy fleet); RolloutManager owns strict pairing.
+        self._weight_update_generation_paused = False
         self.custom_reward_post_process_func = None
         if self.args.custom_reward_post_process_path is not None:
             self.custom_reward_post_process_func = load_function(self.args.custom_reward_post_process_path)
@@ -772,6 +779,56 @@ class RolloutManager:
             for monitor in self._health_monitors:
                 monitor.stop()
             logging_utils.finish_tracking(self.args)
+
+    def _weight_update_generation_hooks(self):
+        """Return the optional, strictly paired custom-rollout hooks."""
+
+        pause = getattr(self.generate_rollout, "pause_for_weight_update", None)
+        resume = getattr(self.generate_rollout, "resume_after_weight_update", None)
+        pause = pause if callable(pause) else None
+        resume = resume if callable(resume) else None
+        if (pause is None) != (resume is None):
+            raise RuntimeError(
+                "Custom rollout weight-update lifecycle is incomplete: "
+                "pause_for_weight_update and resume_after_weight_update must "
+                "both be callable or both be absent"
+            )
+        return pause, resume
+
+    def pause_generation_for_weight_update(self) -> bool:
+        """Freeze/drain custom rollout traffic before SGLang is paused.
+
+        Returns ``True`` when a custom hook was applied and therefore needs a
+        matching resume.  Hook failures propagate before any weight mutation.
+        The hook itself must roll back any partial freeze if it raises.
+        """
+
+        pause, _ = self._weight_update_generation_hooks()
+        if pause is None:
+            return False
+        if self._weight_update_generation_paused:
+            raise RuntimeError("Rollout generation is already paused for a weight update")
+
+        pause(self.args)
+        self._weight_update_generation_paused = True
+        return True
+
+    def resume_generation_after_weight_update(self) -> bool:
+        """Resume a custom rollout only after SGLang has continued generation.
+
+        State is cleared only after the hook succeeds, so a failed resume is
+        fail-closed and can be diagnosed or retried without admitting traffic.
+        """
+
+        _, resume = self._weight_update_generation_hooks()
+        if resume is None:
+            return False
+        if not self._weight_update_generation_paused:
+            raise RuntimeError("Rollout generation is not paused for a weight update")
+
+        resume(self.args)
+        self._weight_update_generation_paused = False
+        return True
 
     @property
     def server(self) -> Any | None:

@@ -117,6 +117,45 @@ def _relay_final_eval_metrics_to_primary(args, metrics) -> None:
     finish_tracking(args, raise_on_error=True)
 
 
+def _update_actor_weights_with_generation_barrier(
+    rollout_manager,
+    actor_model,
+    *,
+    rollout_id: int | None = None,
+):
+    """Freeze custom rollout traffic across an actor -> SGLang weight sync.
+
+    Waiting for ``RolloutManager.generate`` is not sufficient for persistent
+    fully-async rollout functions: their background worker may still have
+    model requests in flight.  An optional custom-rollout hook can freeze new
+    traffic and drain existing traffic before the ordinary SGLang
+    pause/flush/update/continue sequence begins.
+
+    A failed pause prevents the weight update.  A failed weight update leaves
+    the custom rollout paused (fail-closed); resuming could otherwise admit
+    requests while SGLang is still paused or has only partially updated.
+    """
+
+    generation_paused = ray.get(
+        rollout_manager.pause_generation_for_weight_update.remote()
+    )
+    update_succeeded = False
+    try:
+        result = actor_model.update_weights(rollout_id=rollout_id)
+        update_succeeded = True
+        return result
+    finally:
+        if generation_paused and update_succeeded:
+            # actor_model.update_weights returns only after every SGLang engine
+            # has completed continue_generation, so traffic cannot enter early.
+            ray.get(rollout_manager.resume_generation_after_weight_update.remote())
+        elif generation_paused:
+            logger.error(
+                "Actor weight update failed; leaving custom rollout generation "
+                "paused because serving state may be incomplete"
+            )
+
+
 # The framework supports other asynchronous approaches such as fully async (which is shown in examples/full_async).
 def train(args):
     assert not args.colocate, "Colocation is not supported for async training."
@@ -204,7 +243,10 @@ def train(args):
 
     # The initial sync needs healthy, registered rollout engines.
     initial_weight_sync_started_at = time.perf_counter()
-    actor_model.update_weights()
+    _update_actor_weights_with_generation_barrier(
+        rollout_manager,
+        actor_model,
+    )
     startup_metrics["timing/startup_initial_weight_sync_time"] = (
         time.perf_counter() - initial_weight_sync_started_at
     )
@@ -462,7 +504,8 @@ def train(args):
             break
 
         if (rollout_id + 1) % args.update_weights_interval == 0:
-            # sync generate before update weights to prevent update weight in the middle of generation
+            # Join the actor method first; the lifecycle hook below then freezes
+            # any persistent fully-async worker traffic that outlives it.
             rollout_data_curr_ref = (
                 ray.get(x) if (x := rollout_data_next_future) is not None else None
             )
@@ -470,7 +513,11 @@ def train(args):
             if rollout_metrics_ack_future is not None:
                 ray.get(rollout_metrics_ack_future)
                 rollout_metrics_ack_future = None
-            actor_model.update_weights(rollout_id=rollout_id)
+            _update_actor_weights_with_generation_barrier(
+                rollout_manager,
+                actor_model,
+                rollout_id=rollout_id,
+            )
 
         if should_run_periodic_action(
             rollout_id,
@@ -485,7 +532,11 @@ def train(args):
                 # The actor checkpoint above contains this final update, but
                 # SGLang may still serve the last periodic sync. Fixed final
                 # eval must observe exactly the checkpointed actor weights.
-                actor_model.update_weights(rollout_id=rollout_id)
+                _update_actor_weights_with_generation_barrier(
+                    rollout_manager,
+                    actor_model,
+                    rollout_id=rollout_id,
+                )
             eval_metrics = ray.get(
                 rollout_manager.eval.remote(
                     rollout_id,
