@@ -2,6 +2,31 @@
 
 slime's default observability path is intentionally small: training metrics still go to W&B / TensorBoard; high-frequency SGLang Prometheus metrics are no longer uploaded to W&B; request timings from SGLang response `meta_info` are stored in sample traces and aggregated once per rollout step as compact `timing/...` metrics. Throughput, rates, and counters remain under `perf/...`.
 
+## W&B axes in resumed distributed runs
+
+W&B shared mode merges records from the driver, rollout manager, trainer, and
+optional node monitors. The internal `_step` is therefore a transport-row
+counter, not model progress, and its summary value is not a training frontier.
+Use the metric's declared business axis instead:
+
+- training and post-train rollout metrics: `train/step`;
+- evaluation metrics: `eval/train_step`;
+- per-node GPU monitors: that node's namespaced `.../train_step`.
+
+When `--wandb-always-use-train-step` is enabled, slime explicitly binds every
+logged business metric to `train/step`. Online shared writers also request
+server-derived summaries so a worker reconnect or heartbeat cannot restore the
+stale summary snapshot it loaded at startup. Explicit run IDs become the
+default W&B display name; `WANDB_NAME` can still provide a human-readable name.
+
+History remains the source of truth during an active run. Do not attach a
+one-shot conventional writer to backfill older rows into the same active run:
+shared writers have no total arrival order, and the extra writer can corrupt
+the displayed summary or final state. Append-only same-run repair belongs in a
+separate namespace after the run is finished. If live mirroring is required,
+write to a separate run ID with a single publisher and an explicit business
+axis.
+
 ## W&B / TensorBoard Metrics
 
 W&B and TensorBoard still receive reward, loss, KL, entropy, eval, and other training metrics. SGLang duration summaries are logged under `timing/`, while throughput and counters use `perf/`, for example:

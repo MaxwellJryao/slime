@@ -7,6 +7,8 @@ from slime.utils import logging_utils, wandb_utils
 from slime.utils.wandb_utils import (
     _DEFAULT_WANDB_FINISH_TIMEOUT_SECONDS,
     _init_wandb_common,
+    _shared_writer_label,
+    _wandb_run_name,
     _wandb_finish_timeout_seconds,
     define_logged_metric_axes,
 )
@@ -513,6 +515,44 @@ def test_wandb_finish_timeout_can_be_overridden(monkeypatch):
 
 
 @pytest.mark.unit
+def test_explicit_run_id_is_the_default_display_name(monkeypatch):
+    monkeypatch.delenv("WANDB_NAME", raising=False)
+    args = Namespace(wandb_run_id="stable-resumable-run-id")
+
+    assert (
+        _wandb_run_name(
+            args,
+            group="lambda-sweep",
+            generated_name="lambda-sweep",
+        )
+        == "stable-resumable-run-id"
+    )
+
+
+@pytest.mark.unit
+def test_wandb_name_override_remains_authoritative(monkeypatch):
+    monkeypatch.setenv("WANDB_NAME", "human-readable-arm")
+    args = Namespace(wandb_run_id="stable-resumable-run-id")
+
+    assert (
+        _wandb_run_name(
+            args,
+            group="lambda-sweep",
+            generated_name="lambda-sweep",
+        )
+        == "human-readable-arm"
+    )
+
+
+@pytest.mark.unit
+def test_shared_writer_labels_are_stable_and_role_specific():
+    assert _shared_writer_label(primary=True) == "driver"
+    assert _shared_writer_label(primary=False) == "rollout-manager"
+    assert _shared_writer_label(primary=False, role="actor") == "trainer-actor"
+    assert _shared_writer_label(primary=False, role="critic") == "trainer-critic"
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize("mode", ["online", "offline"])
 def test_secondary_wandb_writer_disables_console_capture(monkeypatch, mode):
     args = Namespace(
@@ -537,6 +577,86 @@ def test_secondary_wandb_writer_disables_console_capture(monkeypatch, mode):
     wandb_utils.init_wandb_secondary(args)
 
     assert initialized[0]["settings"]["console"] == "off"
+    if mode == "online":
+        assert initialized[0]["settings"] == {
+            "mode": "shared",
+            "console": "off",
+            "x_primary": False,
+            "x_label": "rollout-manager",
+            "x_update_finish_state": False,
+            "x_server_side_derived_summary": True,
+            "finish_timeout": _DEFAULT_WANDB_FINISH_TIMEOUT_SECONDS,
+        }
+
+
+@pytest.mark.unit
+def test_primary_online_writer_uses_server_summary_and_unique_label(monkeypatch):
+    args = Namespace(
+        use_wandb=True,
+        wandb_run_id="run-id",
+        wandb_mode="online",
+        wandb_key=None,
+        wandb_host=None,
+        wandb_team="team",
+        wandb_project="project",
+        wandb_group="group",
+        wandb_random_suffix=False,
+        wandb_dir=None,
+    )
+    initialized = []
+    monkeypatch.delenv("WANDB_NAME", raising=False)
+    monkeypatch.setattr(wandb_utils.wandb, "Settings", lambda **kwargs: kwargs)
+    monkeypatch.setattr(
+        wandb_utils.wandb,
+        "init",
+        lambda **kwargs: initialized.append(kwargs),
+    )
+    monkeypatch.setattr(wandb_utils.wandb, "run", Namespace(id="run-id"))
+    monkeypatch.setattr(wandb_utils, "_init_wandb_common", lambda _args: None)
+
+    wandb_utils.init_wandb_primary(args)
+
+    assert initialized[0]["name"] == "run-id"
+    assert initialized[0]["group"] == "group"
+    assert initialized[0]["settings"] == {
+        "mode": "shared",
+        "x_primary": True,
+        "x_label": "driver",
+        "x_server_side_derived_summary": True,
+        "finish_timeout": _DEFAULT_WANDB_FINISH_TIMEOUT_SECONDS,
+    }
+
+
+@pytest.mark.unit
+def test_concrete_metric_definitions_request_server_last_summary(monkeypatch):
+    definitions = []
+    monkeypatch.setattr(
+        wandb_utils.wandb,
+        "define_metric",
+        lambda name, **kwargs: definitions.append((name, kwargs)),
+    )
+    _init_wandb_common(_args(always_use_train_step=True))
+    definitions.clear()
+
+    define_logged_metric_axes(
+        {
+            "train/step": 63,
+            "rollout/accuracy_outcome_mean": 0.75,
+            "rollout/total_cost_mean": 9.5,
+        },
+        step_metric="train/step",
+    )
+
+    assert definitions == [
+        (
+            "rollout/accuracy_outcome_mean",
+            {"step_metric": "train/step", "summary": "last"},
+        ),
+        (
+            "rollout/total_cost_mean",
+            {"step_metric": "train/step", "summary": "last"},
+        ),
+    ]
 
 
 if __name__ == "__main__":

@@ -11,6 +11,34 @@ _DEFAULT_WANDB_FINISH_TIMEOUT_SECONDS = 30.0
 _defined_metric_axes: set[tuple[str, str]] = set()
 
 
+def _wandb_run_name(args, *, group: str, generated_name: str) -> str:
+    """Choose a useful display name without changing the stable run identity.
+
+    ``wandb_group`` is an experiment collection, not a run name.  Reusing it
+    as the name makes every arm in a sweep indistinguishable in the UI.  An
+    explicit ``WANDB_NAME`` remains authoritative; otherwise an explicit run
+    ID is the most useful stable label for resumable jobs.
+    """
+
+    explicit_name = os.environ.get("WANDB_NAME", "").strip()
+    if explicit_name:
+        return explicit_name
+    run_id = str(getattr(args, "wandb_run_id", "") or "").strip()
+    if run_id:
+        return run_id
+    return generated_name or group
+
+
+def _shared_writer_label(*, primary: bool, role: str | None = None) -> str:
+    """Return a deterministic, role-unique label for W&B shared mode."""
+
+    if primary:
+        return "driver"
+    if role:
+        return f"trainer-{role}"
+    return "rollout-manager"
+
+
 def _wandb_finish_timeout_seconds() -> float:
     """Keep distributed workers from holding GPU allocations during W&B teardown."""
     raw = os.environ.get(
@@ -72,10 +100,15 @@ def init_wandb_primary(args):
     # add random 6 length string with characters
     if args.wandb_random_suffix:
         group = args.wandb_group + "_" + wandb.util.generate_id()
-        run_name = f"{group}-RANK_{args.rank}"
+        generated_name = f"{group}-RANK_{args.rank}"
     else:
         group = args.wandb_group
-        run_name = args.wandb_group
+        generated_name = args.wandb_group
+    run_name = _wandb_run_name(
+        args,
+        group=group,
+        generated_name=generated_name,
+    )
 
     # Prepare wandb init parameters
     init_kwargs = {
@@ -100,6 +133,12 @@ def init_wandb_primary(args):
         init_kwargs["settings"] = wandb.Settings(
             mode="shared",
             x_primary=True,
+            x_label=_shared_writer_label(primary=True),
+            # Shared writers each maintain a local summary snapshot.  Let the
+            # backend derive automatic summaries from the merged history so a
+            # late worker heartbeat cannot replace newer business metrics with
+            # the snapshot it loaded at startup.
+            x_server_side_derived_summary=True,
             finish_timeout=finish_timeout,
         )
 
@@ -185,7 +224,9 @@ def init_wandb_secondary(args, role=None):
             mode="shared",
             console="off",
             x_primary=False,
+            x_label=_shared_writer_label(primary=False, role=role),
             x_update_finish_state=False,
+            x_server_side_derived_summary=True,
             finish_timeout=_wandb_finish_timeout_seconds(),
         )
 
@@ -218,20 +259,23 @@ def _init_wandb_common(args):
     rollout_step_metric = "train/step" if getattr(args, "wandb_always_use_train_step", False) else "rollout/step"
     eval_step_metric = "eval/train_step" if getattr(args, "wandb_always_use_train_step", False) else "eval/step"
 
-    wandb.define_metric("train/step")
+    # In a resumed shared run, writer-local `_step` and arrival order are not
+    # model progress.  Keep the monotonic business axes useful in the run
+    # summary even when workers finish or reconnect out of order.
+    wandb.define_metric("train/step", summary="max")
     wandb.define_metric("train/*", step_metric="train/step")
     if getattr(args, "wandb_always_use_train_step", False):
-        wandb.define_metric("rollout/step", step_metric="train/step")
+        wandb.define_metric("rollout/step", step_metric="train/step", summary="max")
     else:
-        wandb.define_metric("rollout/step")
+        wandb.define_metric("rollout/step", summary="max")
     wandb.define_metric("rollout/*", step_metric=rollout_step_metric)
     wandb.define_metric("multi_turn/*", step_metric=rollout_step_metric)
     wandb.define_metric("passrate/*", step_metric=rollout_step_metric)
     _define_gpu_sidecar_metric_axes(args)
     if getattr(args, "wandb_always_use_train_step", False):
-        wandb.define_metric("eval/train_step")
+        wandb.define_metric("eval/train_step", summary="max")
     else:
-        wandb.define_metric("eval/step")
+        wandb.define_metric("eval/step", summary="max")
     wandb.define_metric("eval/*", step_metric=eval_step_metric)
     wandb.define_metric("perf/*", step_metric=rollout_step_metric)
     wandb.define_metric("timing/*", step_metric=rollout_step_metric)
@@ -298,5 +342,7 @@ def define_logged_metric_axes(metrics: dict, *, step_metric: str) -> None:
         cache_key = (metric_name, step_metric)
         if cache_key in _defined_metric_axes:
             continue
-        wandb.define_metric(metric_name, step_metric=step_metric)
+        # Explicit ``last`` aggregation is evaluated from history by the
+        # server-side summary reducer configured for shared online runs.
+        wandb.define_metric(metric_name, step_metric=step_metric, summary="last")
         _defined_metric_axes.add(cache_key)
