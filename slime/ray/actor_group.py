@@ -1,5 +1,6 @@
 import logging
 import os
+from pathlib import Path
 from time import perf_counter
 
 import ray
@@ -11,6 +12,64 @@ from slime.utils import logging_utils
 from slime.utils.metric_utils import set_wandb_step
 
 logger = logging.getLogger(__name__)
+
+
+def _configure_tms_preload_env(env_vars: dict[str, str], dynlib_path: str | os.PathLike[str] | None = None) -> None:
+    """Configure a Ray worker to preload the TMS binary matching Torch's CUDA."""
+    if dynlib_path is None:
+        from torch_memory_saver.utils import get_binary_path_from_package
+
+        dynlib_path = get_binary_path_from_package("torch_memory_saver_hook_mode_preload")
+
+    dynlib_path = Path(dynlib_path).resolve()
+    try:
+        cuda_major = dynlib_path.name.rsplit("_cu", 1)[1].split(".", 1)[0]
+    except IndexError as exc:
+        raise RuntimeError(f"Cannot determine CUDA major from TorchMemorySaver binary: {dynlib_path}") from exc
+    if not cuda_major.isdigit():
+        raise RuntimeError(f"Invalid CUDA major in TorchMemorySaver binary: {dynlib_path}")
+
+    existing_ld_library_path = env_vars.get("LD_LIBRARY_PATH", os.environ.get("LD_LIBRARY_PATH", ""))
+    ld_library_entries = [entry for entry in existing_ld_library_path.split(os.pathsep) if entry]
+    binary_roots = tuple(dict.fromkeys((dynlib_path.parent, dynlib_path.parent.parent)))
+    packaged_runtime_candidates = tuple(
+        root / relative
+        for root in binary_roots
+        for relative in (
+            Path("nvidia") / f"cu{cuda_major}" / "lib",
+            Path("nvidia") / "cuda_runtime" / "lib",
+            Path("nvidia") / "cuda_runtime" / "lib64",
+        )
+    )
+    runtime_candidates = tuple(map(Path, ld_library_entries)) + packaged_runtime_candidates
+    runtime_lib_dir = next(
+        (
+            path
+            for path in runtime_candidates
+            if (path / f"libcudart.so.{cuda_major}").is_file()
+        ),
+        None,
+    )
+    if runtime_lib_dir is None:
+        raise FileNotFoundError(
+            f"Cannot find libcudart.so.{cuda_major} required by {dynlib_path}; "
+            f"searched: {', '.join(map(str, runtime_candidates))}"
+        )
+
+    runtime_lib_dir_str = str(runtime_lib_dir)
+    if runtime_lib_dir_str in ld_library_entries:
+        ld_library_entries.remove(runtime_lib_dir_str)
+    ld_library_entries.insert(0, runtime_lib_dir_str)
+
+    env_vars["LD_PRELOAD"] = str(dynlib_path)
+    env_vars["LD_LIBRARY_PATH"] = os.pathsep.join(ld_library_entries)
+    env_vars["TMS_INIT_ENABLE"] = "1"
+    env_vars["TMS_INIT_ENABLE_CPU_BACKUP"] = "1"
+    logger.info(
+        "Configured TorchMemorySaver preload binary=%s cuda_runtime_lib=%s",
+        dynlib_path,
+        runtime_lib_dir,
+    )
 
 
 class RayTrainGroup:
@@ -68,24 +127,7 @@ class RayTrainGroup:
         }
 
         if self.args.offload_train and self.args.train_backend == "megatron":
-            import torch_memory_saver
-
-            for path in [
-                "torch_memory_saver_hook_mode_preload_cu12.abi3.so",
-                "torch_memory_saver_hook_mode_preload.abi3.so",
-            ]:
-                dynlib_path = os.path.join(
-                    os.path.dirname(os.path.dirname(torch_memory_saver.__file__)),
-                    path,
-                )
-                if os.path.exists(dynlib_path):
-                    break
-            else:
-                raise FileNotFoundError("Cannot find torch_memory_saver dynamic library. Please make sure torch_memory_saver is properly installed.")
-
-            env_vars["LD_PRELOAD"] = dynlib_path
-            env_vars["TMS_INIT_ENABLE"] = "1"
-            env_vars["TMS_INIT_ENABLE_CPU_BACKUP"] = "1"
+            _configure_tms_preload_env(env_vars)
 
         # We cannot do routing replay for critic.
         if self.args.use_routing_replay and self.role == "actor":
