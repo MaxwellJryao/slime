@@ -89,6 +89,24 @@ class TestMegatronRoleConfig:
         assert critic_args.kl_coef == 0
         assert critic_args.use_opd is False
 
+    def test_role_override_rejects_scalar_freeze_pattern(self):
+        from slime.utils.arguments import parse_megatron_role_args
+
+        path = _write_yaml(
+            {
+                "megatron": [
+                    {
+                        "name": "default",
+                        "role": "critic",
+                        "overrides": {"freeze_params_name_list": "self_attention"},
+                    },
+                ]
+            }
+        )
+
+        with pytest.raises(ValueError, match="non-empty list"):
+            parse_megatron_role_args(_base_args(), path, role="critic")
+
     @pytest.mark.parametrize(
         "config",
         [

@@ -179,7 +179,11 @@ def _reinitialize_critic_output_layer(args: Namespace, model: Sequence[DDP]) -> 
             output_layer.bias.data.zero_()
 
 
-def get_optimizer_param_scheduler(args: Namespace, optimizer: MegatronOptimizer) -> OptimizerParamScheduler:
+def get_optimizer_param_scheduler(
+    args: Namespace,
+    optimizer: MegatronOptimizer,
+    role: str = "actor",
+) -> OptimizerParamScheduler:
     """Create and configure the optimizer learning-rate/weight-decay scheduler.
 
     This configures iteration-based schedules derived from the global batch size
@@ -201,7 +205,14 @@ def get_optimizer_param_scheduler(args: Namespace, optimizer: MegatronOptimizer)
     # resume), so the worst case is the cosine/linear schedule reaches its
     # plateau slightly early or late. Pass ``--lr-decay-iters`` explicitly if you
     # need exact decay control.
-    args.train_iters = args.num_rollout * args.rollout_batch_size * args.n_samples_per_prompt // args.global_batch_size
+    train_epochs = (
+        getattr(args, "critic_train_epochs", 1)
+        if role == "critic" and getattr(args, "policy_loss_type", "ppo") == "sao_dis"
+        else 1
+    )
+    args.train_iters = (
+        args.num_rollout * args.rollout_batch_size * args.n_samples_per_prompt * train_epochs // args.global_batch_size
+    )
     if args.lr_decay_iters is None:
         args.lr_decay_iters = args.train_iters
     lr_decay_steps = args.lr_decay_iters * args.global_batch_size
@@ -334,7 +345,7 @@ def setup_model_and_optimizer(
         )
     if args.use_stateless_adam:
         _disable_distributed_optimizer_state_initialization(optimizer)
-    opt_param_scheduler = get_optimizer_param_scheduler(args, optimizer)
+    opt_param_scheduler = get_optimizer_param_scheduler(args, optimizer, role=role)
     return model, optimizer, opt_param_scheduler
 
 
@@ -766,6 +777,7 @@ def train(
     data_iterator: Sequence[DataIterator],
     num_microbatches: Sequence[int],
     global_batch_sizes: Sequence[int],
+    train_epoch_id: int = 0,
 ) -> None:
     """Run training over a rollout consisting of multiple steps.
 
@@ -925,6 +937,8 @@ def train(
 
             # Per-step gbs — uneven step sizes are easy to miss without this.
             log_dict[f"train/{role_tag}global_batch_size"] = global_batch_sizes[step_id]
+            if role == "critic" and getattr(args, "policy_loss_type", "ppo") == "sao_dis":
+                log_dict["train/critic-epoch"] = train_epoch_id + 1
             log_dict["train/step"] = accumulated_step_id
             if role == "actor":
                 try:

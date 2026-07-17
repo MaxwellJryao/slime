@@ -18,10 +18,12 @@ from slime.utils.ppo_utils import (
     compute_gspo_kl,
     compute_opsm_mask,
     compute_policy_loss,
+    compute_sao_dis_loss,
     get_advantages_and_returns_batch,
     get_grpo_returns,
     get_reinforce_plus_plus_baseline_advantages,
     get_reinforce_plus_plus_returns,
+    get_skip_observation_advantages_and_returns_batch,
 )
 from slime.utils.types import RolloutBatch
 
@@ -723,18 +725,32 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
         advantages = [r for r in returns]
 
     elif args.advantage_estimator == "ppo":
-        old_rewards = rewards
-        rewards = []
-        kl_coef = -args.kl_coef
-        cp_rank = mpu.get_context_parallel_rank()
-        for reward, k in zip(old_rewards, kl, strict=False):
-            k *= kl_coef
-            if cp_rank == 0:
-                k[-1] += reward
-            rewards.append(k)
-        advantages, returns = get_advantages_and_returns_batch(
-            total_lengths, response_lengths, values, rewards, args.gamma, args.lambd
-        )
+        if getattr(args, "policy_loss_type", "ppo") == "sao_dis":
+            token_rewards = [(-args.kl_coef) * k for k in kl]
+            advantages, returns = get_skip_observation_advantages_and_returns_batch(
+                total_lengths=total_lengths,
+                response_lengths=response_lengths,
+                values_list=values,
+                token_rewards_list=token_rewards,
+                sequence_rewards=rewards,
+                action_masks=loss_masks,
+                gamma=args.gamma,
+                length_adaptive_alpha=args.sao_length_adaptive_gae_alpha,
+                critic_lambd=args.sao_critic_gae_lambda,
+            )
+        else:
+            old_rewards = rewards
+            rewards = []
+            kl_coef = -args.kl_coef
+            cp_rank = mpu.get_context_parallel_rank()
+            for reward, k in zip(old_rewards, kl, strict=False):
+                k *= kl_coef
+                if cp_rank == 0:
+                    k[-1] += reward
+                rewards.append(k)
+            advantages, returns = get_advantages_and_returns_batch(
+                total_lengths, response_lengths, values, rewards, args.gamma, args.lambd
+            )
 
     elif args.advantage_estimator == "reinforce_plus_plus":
         rewards = torch.tensor(rewards, dtype=torch.float32, device=kl[0].device)
@@ -976,7 +992,39 @@ def policy_loss_function(
         ppo_kl = old_log_probs - log_probs
 
     dppo_divergence = None
-    if getattr(args, "policy_loss_type", "ppo") == "dppo":
+    sao_dis_metrics = None
+    if getattr(args, "policy_loss_type", "ppo") == "sao_dis":
+        # Full response masks must follow the same CP zig-zag slicing as the
+        # current and behavior log probabilities before they can be aligned.
+        local_response_masks = batch["loss_masks"]
+        if mpu.get_context_parallel_world_size() > 1:
+            local_response_masks = [
+                slice_log_prob_with_cp(mask, total_length, response_length)
+                for mask, total_length, response_length in zip(
+                    local_response_masks,
+                    total_lengths,
+                    response_lengths,
+                    strict=True,
+                )
+            ]
+        response_mask = torch.cat(local_response_masks, dim=0).bool()
+        pg_loss, below, above, retained_ratio = compute_sao_dis_loss(
+            behavior_log_probs=old_log_probs,
+            policy_log_probs=log_probs,
+            advantages=advantages,
+            response_mask=response_mask,
+            eps_low=args.sao_dis_eps_low,
+            eps_high=args.sao_dis_eps_high,
+        )
+        pg_clipfrac = below + above
+        sao_dis_metrics = {
+            "sao_dis_retained_ratio": retained_ratio,
+            "sao_dis_below_frac": below,
+            "sao_dis_above_frac": above,
+            "sao_dis_masked_frac": pg_clipfrac,
+            "sao_dis_effective_frac": response_mask.to(log_probs.dtype) - pg_clipfrac,
+        }
+    elif getattr(args, "policy_loss_type", "ppo") == "dppo":
         response_mask = torch.cat(batch["loss_masks"], dim=0).bool()
         pg_loss, pg_clipfrac, dppo_divergence = compute_dppo_loss(
             behavior_log_probs=old_log_probs,
@@ -1084,7 +1132,8 @@ def policy_loss_function(
     train_rollout_logprob_abs_diff = None
     if "rollout_log_probs" in batch and batch["rollout_log_probs"]:
         rollout_log_probs = torch.cat(batch["rollout_log_probs"], dim=0)
-        train_rollout_logprob_abs_diff = sum_of_sample_mean((old_log_probs - rollout_log_probs).abs())
+        train_log_probs = log_probs if args.use_rollout_logprobs else old_log_probs
+        train_rollout_logprob_abs_diff = sum_of_sample_mean((train_log_probs - rollout_log_probs).abs())
 
     reported_loss = {
         "loss": loss.clone().detach(),
@@ -1096,6 +1145,10 @@ def policy_loss_function(
 
     if dppo_divergence is not None:
         reported_loss["dppo_binary_tv"] = sum_of_sample_mean(dppo_divergence).clone().detach()
+
+    if sao_dis_metrics is not None:
+        for metric_name, metric_value in sao_dis_metrics.items():
+            reported_loss[metric_name] = sum_of_sample_mean(metric_value).clone().detach()
 
     if train_rollout_logprob_abs_diff is not None:
         reported_loss["train_rollout_logprob_abs_diff"] = train_rollout_logprob_abs_diff.clone().detach()

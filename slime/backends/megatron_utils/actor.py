@@ -404,7 +404,14 @@ class MegatronTrainRayActor(TrainRayActor):
         return result
 
     def train_critic(self, rollout_id: int, rollout_data: RolloutBatch):
-        """Train critic and return CPU values (used as old-values for the next actor train)."""
+        """Train the critic, preserving vanilla PPO and enabling SAO K updates.
+
+        Vanilla PPO retains its historical one-update/pre-update-value
+        behavior. For SAO, critic returns and the value-clipping anchor are
+        constructed once from pre-update values, remain fixed across K
+        updates, and a fresh post-update value forward is returned to the
+        actor.
+        """
         data_iterator = get_data_iterator(rollout_data)
         num_microbatches = rollout_data["num_microbatches"]
         global_batch_sizes = rollout_data["global_batch_sizes"]
@@ -415,20 +422,42 @@ class MegatronTrainRayActor(TrainRayActor):
         compute_advantages_and_returns(self.args, rollout_data)
 
         self.args.loss_type = "value_loss"
-        train(
-            rollout_id,
-            self.model,
-            self.optimizer,
-            self.opt_param_scheduler,
-            data_iterator,
-            num_microbatches,
-            global_batch_sizes,
-        )
+        is_sao_dis = getattr(self.args, "policy_loss_type", "ppo") == "sao_dis"
+        if is_sao_dis:
+            for critic_epoch in range(self.args.critic_train_epochs):
+                train(
+                    rollout_id,
+                    self.model,
+                    self.optimizer,
+                    self.opt_param_scheduler,
+                    data_iterator,
+                    num_microbatches,
+                    global_batch_sizes,
+                    train_epoch_id=critic_epoch,
+                )
+            returned_values = forward_only(
+                get_values,
+                self.args,
+                self.model,
+                data_iterator,
+                num_microbatches,
+            )
+        else:
+            train(
+                rollout_id,
+                self.model,
+                self.optimizer,
+                self.opt_param_scheduler,
+                data_iterator,
+                num_microbatches,
+                global_batch_sizes,
+            )
+            returned_values = rollout_data
 
-        if mpu.is_pipeline_last_stage() and "values" in rollout_data:
+        if mpu.is_pipeline_last_stage() and "values" in returned_values:
             from slime.backends.megatron_utils.data import tensors_to_cpu
 
-            return {"values": tensors_to_cpu(rollout_data["values"])}
+            return {"values": tensors_to_cpu(returned_values["values"])}
         return {}
 
     def train_actor(self, rollout_id: int, rollout_data: RolloutBatch, external_data=None) -> None:

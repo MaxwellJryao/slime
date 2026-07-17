@@ -244,7 +244,7 @@ def _get_model_provider_func(
     return model_provider
 
 
-def wrap_model_provider_with_freeze(original_provider, args):
+def wrap_model_provider_with_freeze(original_provider, args, role="actor"):
     def wrapped_provider(
         pre_process=True,
         post_process=True,
@@ -260,7 +260,7 @@ def wrap_model_provider_with_freeze(original_provider, args):
                 provider_kwargs[key] = kwargs.get(key, None)
 
         model = original_provider(**provider_kwargs)
-        freeze_model_params(model, args)
+        freeze_model_params(model, args, role=role)
 
         return model
 
@@ -296,10 +296,45 @@ def wrap_model_provider_with_fp32_lm_head(original_provider, args, role):
 def get_model_provider_func(args, role="actor"):
     provider = _get_model_provider_func(args, role)
     provider = wrap_model_provider_with_fp32_lm_head(provider, args, role)
-    return wrap_model_provider_with_freeze(provider, args)
+    return wrap_model_provider_with_freeze(provider, args, role=role)
 
 
-def freeze_model_params(model: GPTModel, args: argparse.Namespace):
+def validate_sao_critic_attention_freeze(
+    model: GPTModel,
+    args: argparse.Namespace,
+    role: str,
+) -> None:
+    """Fail closed unless every identified SAO critic attention parameter is frozen."""
+    if role != "critic" or getattr(args, "policy_loss_type", "ppo") != "sao_dis":
+        return
+
+    pattern_text = getattr(args, "sao_attention_param_pattern", r"(?:^|\.)self_attention(?:\.|$)")
+    try:
+        attention_pattern = re.compile(pattern_text)
+    except (re.error, TypeError) as exc:
+        raise ValueError(f"Invalid SAO critic attention regex: {pattern_text!r}") from exc
+
+    named_parameters = list(model.named_parameters())
+    attention_parameters = [(name, param) for name, param in named_parameters if attention_pattern.search(name)]
+    if not attention_parameters:
+        raise RuntimeError(
+            "SAO critic attention-freeze validation matched zero parameters; "
+            f"check sao_attention_param_pattern={pattern_text!r}"
+        )
+
+    trainable_attention = [name for name, param in attention_parameters if param.requires_grad]
+    if trainable_attention:
+        preview = ", ".join(trainable_attention[:8])
+        raise RuntimeError(f"SAO critic attention parameters remain trainable: {preview}")
+
+    trainable_non_attention = [
+        name for name, param in named_parameters if param.requires_grad and not attention_pattern.search(name)
+    ]
+    if not trainable_non_attention:
+        raise RuntimeError("SAO critic freeze configuration left no non-attention parameters trainable")
+
+
+def freeze_model_params(model: GPTModel, args: argparse.Namespace, role: str = "actor"):
     if getattr(args, "only_train_params_name_list", None):
         for name, param in model.named_parameters():
             param.requires_grad = False
@@ -314,3 +349,5 @@ def freeze_model_params(model: GPTModel, args: argparse.Namespace):
                 if re.search(pattern, name):
                     param.requires_grad = False
                     break
+
+    validate_sao_critic_attention_freeze(model, args, role)

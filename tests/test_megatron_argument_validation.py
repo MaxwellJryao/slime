@@ -261,6 +261,15 @@ def make_slime_validate_args(**overrides):
         policy_loss_type="ppo",
         dppo_divergence_type="tv",
         dppo_divergence_threshold=0.1,
+        critic_train_epochs=1,
+        sao_dis_eps_low=0.3,
+        sao_dis_eps_high=5.0,
+        sao_length_adaptive_gae_alpha=1.5,
+        sao_critic_gae_lambda=1.0,
+        sao_attention_param_pattern=r"(?:^|\.)self_attention(?:\.|$)",
+        keep_old_actor=False,
+        use_opsm=False,
+        custom_advantage_function_path=None,
         compute_advantages_and_returns=True,
         use_dynamic_batch_size=False,
         max_tokens_per_gpu=None,
@@ -431,6 +440,63 @@ def test_dppo_requires_group_relative_advantages(monkeypatch):
     )
 
     with pytest.raises(ValueError, match="requires --advantage-estimator=grpo"):
+        module.slime_validate_args(args)
+
+
+@pytest.mark.unit
+def test_sao_dis_accepts_single_rollout_ppo_contract(monkeypatch):
+    module = load_slime_arguments_module(monkeypatch)
+    args = make_slime_validate_args(
+        policy_loss_type="sao_dis",
+        advantage_estimator="ppo",
+        use_rollout_logprobs=True,
+        n_samples_per_prompt=1,
+        critic_train_epochs=2,
+    )
+
+    module.slime_validate_args(args)
+
+    assert args.use_critic is True
+
+
+@pytest.mark.unit
+def test_vanilla_ppo_rejects_sao_only_multi_epoch_critic(monkeypatch):
+    module = load_slime_arguments_module(monkeypatch)
+    args = make_slime_validate_args(
+        policy_loss_type="ppo",
+        advantage_estimator="ppo",
+        critic_train_epochs=2,
+    )
+
+    with pytest.raises(ValueError, match="restricted to --policy-loss-type=sao_dis"):
+        module.slime_validate_args(args)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"use_rollout_logprobs": False}, "requires --use-rollout-logprobs"),
+        ({"n_samples_per_prompt": 2}, "requires --n-samples-per-prompt=1"),
+        ({"critic_train_epochs": 1}, "requires --critic-train-epochs=2"),
+        ({"sao_dis_eps_low": 1.0}, "--sao-dis-eps-low"),
+        ({"sao_dis_eps_high": float("inf")}, "--sao-dis-eps-high"),
+        ({"sao_length_adaptive_gae_alpha": 0.0}, "--sao-length-adaptive-gae-alpha"),
+    ],
+)
+def test_sao_dis_rejects_incomplete_contract(monkeypatch, overrides, message):
+    module = load_slime_arguments_module(monkeypatch)
+    base = dict(
+        policy_loss_type="sao_dis",
+        advantage_estimator="ppo",
+        use_rollout_logprobs=True,
+        n_samples_per_prompt=1,
+        critic_train_epochs=2,
+    )
+    base.update(overrides)
+    args = make_slime_validate_args(**base)
+
+    with pytest.raises(ValueError, match=message):
         module.slime_validate_args(args)
 
 

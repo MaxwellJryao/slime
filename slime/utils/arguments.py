@@ -4,6 +4,7 @@ import json
 import logging
 import math
 import os
+import re
 import warnings
 from typing import Any
 
@@ -948,6 +949,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Number of initial rollout steps that train critic only; set >= num_rollout for critic-only runs",
             )
             parser.add_argument(
+                "--critic-train-epochs",
+                type=int,
+                default=1,
+                help=(
+                    "Number of complete value-model updates over each rollout batch. "
+                    "Values greater than 1 are currently SAO-only; SAO requires 2, "
+                    "while standard PPO keeps its historical single update."
+                ),
+            )
+            parser.add_argument(
                 "--megatron-config-path",
                 type=str,
                 default=None,
@@ -986,12 +997,46 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--policy-loss-type",
                 type=str,
-                choices=["ppo", "dppo"],
+                choices=["ppo", "dppo", "sao_dis"],
                 default="ppo",
                 help=(
                     "Policy surrogate used when --loss-type=policy_loss. 'ppo' uses the "
                     "usual clipped-ratio objective; 'dppo' uses the directional binary-"
-                    "divergence trust region from arXiv:2602.04879."
+                    "divergence trust region from arXiv:2602.04879; 'sao_dis' uses the "
+                    "strict direct rollout-ratio mask from arXiv:2607.07508."
+                ),
+            )
+            parser.add_argument(
+                "--sao-dis-eps-low",
+                type=float,
+                default=0.3,
+                help="SAO DIS lower delta: retain ratios strictly greater than 1 - eps_low.",
+            )
+            parser.add_argument(
+                "--sao-dis-eps-high",
+                type=float,
+                default=5.0,
+                help="SAO DIS upper delta: retain ratios strictly less than 1 + eps_high.",
+            )
+            parser.add_argument(
+                "--sao-length-adaptive-gae-alpha",
+                type=float,
+                default=1.5,
+                help="Alpha in SAO policy lambda = 1 - 1 / (alpha * raw_response_length).",
+            )
+            parser.add_argument(
+                "--sao-critic-gae-lambda",
+                type=float,
+                default=1.0,
+                help="GAE lambda used to construct SAO value-model targets.",
+            )
+            parser.add_argument(
+                "--sao-attention-param-pattern",
+                type=str,
+                default=r"(?:^|\.)self_attention(?:\.|$)",
+                help=(
+                    "Regex identifying critic attention parameters for fail-closed SAO freeze validation. "
+                    "Freeze them through the critic role's freeze_params_name_list or only_train_params_name_list."
                 ),
             )
             parser.add_argument(
@@ -1721,6 +1766,20 @@ def _apply_megatron_role_overrides(base_args, overrides, role):
                     pass
         setattr(role_args, key, value)
 
+    # Role YAML is applied after the main CLI validation. Validate the two
+    # regex-list fields again here so a scalar YAML string cannot silently be
+    # iterated character-by-character as freeze patterns.
+    for field_name in ("only_train_params_name_list", "freeze_params_name_list"):
+        patterns = getattr(role_args, field_name, None)
+        if patterns is not None and (
+            not isinstance(patterns, list)
+            or not patterns
+            or any(not isinstance(pattern, str) or not pattern for pattern in patterns)
+        ):
+            raise ValueError(f"{role} {field_name} must be a non-empty list of non-empty regex strings")
+    if getattr(role_args, "only_train_params_name_list", None) and getattr(role_args, "freeze_params_name_list", None):
+        raise ValueError(f"{role} cannot set both only_train_params_name_list and freeze_params_name_list")
+
     if role == "critic":
         # Critic-specific: disable features that only apply to actors.
         role_args.kl_coef = 0
@@ -1729,6 +1788,11 @@ def _apply_megatron_role_overrides(base_args, overrides, role):
         role_args.untie_embeddings_and_output_weights = True
         if "disable_param_buffers_cpu_backup" not in overrides:
             role_args.disable_param_buffers_cpu_backup = False
+        if (
+            getattr(role_args, "policy_loss_type", "ppo") == "sao_dis"
+            and getattr(role_args, "critic_train_epochs", 1) != 2
+        ):
+            raise ValueError("SAO-inspired critic role requires critic_train_epochs=2")
 
     return role_args
 
@@ -1907,6 +1971,54 @@ def slime_validate_args(args):
             or args.dppo_divergence_threshold <= 0
         ):
             raise ValueError("--dppo-divergence-threshold must be a finite number greater than zero")
+
+    critic_train_epochs = getattr(args, "critic_train_epochs", 1)
+    if not isinstance(critic_train_epochs, int) or critic_train_epochs < 1:
+        raise ValueError("--critic-train-epochs must be an integer greater than or equal to one")
+    if critic_train_epochs > 1 and getattr(args, "policy_loss_type", "ppo") != "sao_dis":
+        raise ValueError(
+            "--critic-train-epochs greater than one is currently restricted to --policy-loss-type=sao_dis"
+        )
+
+    if getattr(args, "policy_loss_type", "ppo") == "sao_dis":
+        if args.loss_type != "policy_loss":
+            raise ValueError("--policy-loss-type=sao_dis requires --loss-type=policy_loss")
+        if args.advantage_estimator != "ppo":
+            raise ValueError("--policy-loss-type=sao_dis requires --advantage-estimator=ppo")
+        if not args.use_rollout_logprobs:
+            raise ValueError(
+                "--policy-loss-type=sao_dis requires --use-rollout-logprobs so the ratio is anchored "
+                "directly to the behavior policy that generated each token"
+            )
+        if args.n_samples_per_prompt != 1:
+            raise ValueError("--policy-loss-type=sao_dis requires --n-samples-per-prompt=1")
+        if critic_train_epochs != 2:
+            raise ValueError("--policy-loss-type=sao_dis requires --critic-train-epochs=2")
+        if getattr(args, "keep_old_actor", False):
+            raise ValueError("--policy-loss-type=sao_dis drops the old policy and cannot use --keep-old-actor")
+        if getattr(args, "use_opsm", False):
+            raise ValueError("--policy-loss-type=sao_dis cannot be combined with --use-opsm")
+        if args.use_tis or args.get_mismatch_metrics:
+            raise ValueError("--policy-loss-type=sao_dis cannot be combined with TIS/mismatch loss transforms")
+        if getattr(args, "custom_advantage_function_path", None) is not None:
+            raise ValueError("--policy-loss-type=sao_dis requires the built-in skip-observation GAE")
+
+        eps_low = getattr(args, "sao_dis_eps_low", 0.3)
+        eps_high = getattr(args, "sao_dis_eps_high", 5.0)
+        alpha = getattr(args, "sao_length_adaptive_gae_alpha", 1.5)
+        critic_lambd = getattr(args, "sao_critic_gae_lambda", 1.0)
+        if not math.isfinite(eps_low) or not 0 < eps_low < 1:
+            raise ValueError("--sao-dis-eps-low must be finite and in (0, 1)")
+        if not math.isfinite(eps_high) or eps_high <= 0:
+            raise ValueError("--sao-dis-eps-high must be finite and greater than zero")
+        if not math.isfinite(alpha) or alpha <= 0:
+            raise ValueError("--sao-length-adaptive-gae-alpha must be finite and greater than zero")
+        if not math.isfinite(critic_lambd) or not 0 <= critic_lambd <= 1:
+            raise ValueError("--sao-critic-gae-lambda must be finite and in [0, 1]")
+        try:
+            re.compile(getattr(args, "sao_attention_param_pattern", r"(?:^|\.)self_attention(?:\.|$)"))
+        except (re.error, TypeError) as exc:
+            raise ValueError("--sao-attention-param-pattern must be a valid regex") from exc
 
     logprob_guard_threshold = args.max_train_rollout_logprob_abs_diff
     if logprob_guard_threshold is not None:
