@@ -1,4 +1,6 @@
 from argparse import Namespace
+import json
+import stat
 
 import pytest
 
@@ -790,6 +792,125 @@ def test_primary_online_writer_uses_server_summary_and_unique_label(monkeypatch)
         "x_server_side_derived_summary": True,
         "finish_timeout": _DEFAULT_WANDB_FINISH_TIMEOUT_SECONDS,
     }
+
+
+def _fresh_primary_args(tmp_path):
+    return Namespace(
+        use_wandb=True,
+        use_critic=False,
+        rank=0,
+        wandb_run_id="fresh-run",
+        wandb_mode="online",
+        wandb_key=None,
+        wandb_host=None,
+        wandb_team="hwinf_dcm",
+        wandb_project="project",
+        wandb_group="group",
+        wandb_random_suffix=False,
+        wandb_dir=str(tmp_path / "wandb"),
+    )
+
+
+@pytest.mark.unit
+def test_fresh_primary_publishes_private_marker_only_after_never_init(
+    monkeypatch, tmp_path
+):
+    marker = tmp_path / "primary-ready.json"
+    monkeypatch.setenv("WANDB_RESUME", "never")
+    monkeypatch.setenv("WANDB_PRIMARY_READY_FILE", str(marker))
+    monkeypatch.setenv("WANDB_PRIMARY_READY_TOKEN", "slurm-123-restart-0")
+    initialized = []
+    primary_run = Namespace(id="fresh-run")
+    monkeypatch.setattr(wandb_utils.wandb, "Settings", lambda **kwargs: kwargs)
+
+    def init(**kwargs):
+        assert not marker.exists()
+        initialized.append(kwargs)
+        return primary_run
+
+    monkeypatch.setattr(wandb_utils.wandb, "init", init)
+    monkeypatch.setattr(wandb_utils.wandb, "run", primary_run)
+    monkeypatch.setattr(wandb_utils, "_init_wandb_common", lambda _args: None)
+
+    wandb_utils.init_wandb_primary(_fresh_primary_args(tmp_path))
+
+    assert initialized[0]["resume"] == "never"
+    assert initialized[0]["entity"] == "hwinf_dcm"
+    assert initialized[0]["settings"]["x_primary"] is True
+    assert stat.S_IMODE(marker.stat().st_mode) == 0o600
+    assert json.loads(marker.read_text(encoding="utf-8")) == {
+        "schema_version": 1,
+        "schema": "slime.wandb-primary-ready/v1",
+        "entity": "hwinf_dcm",
+        "project": "project",
+        "group": "group",
+        "run_id": "fresh-run",
+        "launch_token": "slurm-123-restart-0",
+        "primary_label": "driver",
+        "resume": "never",
+    }
+
+
+@pytest.mark.unit
+def test_true_preexisting_cloud_collision_produces_no_primary_marker(
+    monkeypatch, tmp_path
+):
+    marker = tmp_path / "primary-ready.json"
+    monkeypatch.setenv("WANDB_RESUME", "never")
+    monkeypatch.setenv("WANDB_PRIMARY_READY_FILE", str(marker))
+    monkeypatch.setenv("WANDB_PRIMARY_READY_TOKEN", "slurm-124-restart-0")
+    monkeypatch.setattr(wandb_utils.wandb, "Settings", lambda **kwargs: kwargs)
+
+    def collision(**kwargs):
+        assert kwargs["resume"] == "never"
+        assert not marker.exists()
+        raise RuntimeError("run already exists")
+
+    monkeypatch.setattr(wandb_utils.wandb, "init", collision)
+
+    with pytest.raises(RuntimeError, match="already exists"):
+        wandb_utils.init_wandb_primary(_fresh_primary_args(tmp_path))
+
+    assert not marker.exists()
+
+
+@pytest.mark.unit
+def test_stale_primary_marker_blocks_before_any_cloud_init(monkeypatch, tmp_path):
+    marker = tmp_path / "primary-ready.json"
+    marker.write_text("stale\n", encoding="utf-8")
+    marker.chmod(0o600)
+    monkeypatch.setenv("WANDB_RESUME", "never")
+    monkeypatch.setenv("WANDB_PRIMARY_READY_FILE", str(marker))
+    monkeypatch.setenv("WANDB_PRIMARY_READY_TOKEN", "slurm-125-restart-0")
+    monkeypatch.setattr(wandb_utils.wandb, "Settings", lambda **kwargs: kwargs)
+    monkeypatch.setattr(
+        wandb_utils.wandb,
+        "init",
+        lambda **_kwargs: pytest.fail("stale marker must block before wandb.init"),
+    )
+
+    with pytest.raises(FileExistsError, match="stale"):
+        wandb_utils.init_wandb_primary(_fresh_primary_args(tmp_path))
+
+
+@pytest.mark.unit
+def test_non_private_marker_parent_blocks_before_any_cloud_init(monkeypatch, tmp_path):
+    public_parent = tmp_path / "public-run"
+    public_parent.mkdir(mode=0o755)
+    public_parent.chmod(0o755)
+    marker = public_parent / "primary-ready.json"
+    monkeypatch.setenv("WANDB_RESUME", "never")
+    monkeypatch.setenv("WANDB_PRIMARY_READY_FILE", str(marker))
+    monkeypatch.setenv("WANDB_PRIMARY_READY_TOKEN", "slurm-126-restart-0")
+    monkeypatch.setattr(wandb_utils.wandb, "Settings", lambda **kwargs: kwargs)
+    monkeypatch.setattr(
+        wandb_utils.wandb,
+        "init",
+        lambda **_kwargs: pytest.fail("public marker parent must block wandb.init"),
+    )
+
+    with pytest.raises(ValueError, match="private"):
+        wandb_utils.init_wandb_primary(_fresh_primary_args(public_parent))
 
 
 @pytest.mark.unit

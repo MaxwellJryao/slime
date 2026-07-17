@@ -1,8 +1,12 @@
+import json
 import logging
 import math
 import os
 import re
+import secrets
+import stat
 from copy import deepcopy
+from pathlib import Path
 
 import wandb
 
@@ -10,6 +14,10 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_WANDB_FINISH_TIMEOUT_SECONDS = 30.0
 _defined_metric_axes: set[tuple[str, str]] = set()
+_WANDB_PRIMARY_READY_SCHEMA = "slime.wandb-primary-ready/v1"
+_WANDB_PRIMARY_READY_FILE_ENV = "WANDB_PRIMARY_READY_FILE"
+_WANDB_PRIMARY_READY_TOKEN_ENV = "WANDB_PRIMARY_READY_TOKEN"
+_WANDB_PRIMARY_READY_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}")
 
 # Deliberately map only reviewed, non-secret environment variables to stable
 # W&B config keys.  Do not broaden this to an environment dump: distributed
@@ -70,6 +78,164 @@ def _shared_writer_label(*, primary: bool, role: str | None = None) -> str:
     return "rollout-manager"
 
 
+def _primary_ready_marker_identity(
+    args, *, group: str
+) -> dict[str, str | int] | None:
+    """Build the exact identity an auxiliary writer must observe.
+
+    Fresh shared runs deliberately retain ``resume=never`` collision
+    protection.  A local marker is therefore enabled only when the launcher
+    provides both a destination and a per-allocation token.  It is not a
+    substitute for W&B's collision check: it is published only after that
+    check and all primary metric definitions have succeeded.
+    """
+
+    raw_path = os.environ.get(_WANDB_PRIMARY_READY_FILE_ENV, "")
+    if not raw_path:
+        return None
+    path = Path(raw_path)
+    if not path.is_absolute():
+        raise ValueError(f"{_WANDB_PRIMARY_READY_FILE_ENV} must be absolute")
+
+    token = os.environ.get(_WANDB_PRIMARY_READY_TOKEN_ENV, "")
+    if _WANDB_PRIMARY_READY_TOKEN_RE.fullmatch(token) is None:
+        raise ValueError(
+            f"{_WANDB_PRIMARY_READY_TOKEN_ENV} must be a safe non-empty "
+            "allocation token"
+        )
+    resume = os.environ.get("WANDB_RESUME", "allow")
+    if resume != "never":
+        raise ValueError(
+            f"{_WANDB_PRIMARY_READY_FILE_ENV} requires WANDB_RESUME=never; "
+            f"got {resume!r}"
+        )
+
+    run_id = str(getattr(args, "wandb_run_id", "") or "")
+    project = str(getattr(args, "wandb_project", "") or "")
+    entity = str(getattr(args, "wandb_team", "") or "")
+    if not entity or not run_id or not project or not group:
+        raise ValueError(
+            "primary-ready marker requires W&B entity, run, project, and group "
+            "identities"
+        )
+    return {
+        "schema_version": 1,
+        "schema": _WANDB_PRIMARY_READY_SCHEMA,
+        "entity": entity,
+        "project": project,
+        "group": group,
+        "run_id": run_id,
+        "launch_token": token,
+        "primary_label": _shared_writer_label(primary=True),
+        "resume": resume,
+    }
+
+
+def _prepare_primary_ready_marker(identity: dict[str, str | int] | None) -> Path | None:
+    """Fail before network initialization if the marker destination is stale."""
+
+    if identity is None:
+        return None
+    path = Path(os.environ[_WANDB_PRIMARY_READY_FILE_ENV])
+    try:
+        parent_info = path.parent.lstat()
+    except FileNotFoundError as exc:
+        raise ValueError("primary-ready marker parent does not exist") from exc
+    if (
+        path.parent.resolve(strict=True) != path.parent
+        or stat.S_ISLNK(parent_info.st_mode)
+        or not stat.S_ISDIR(parent_info.st_mode)
+        or parent_info.st_uid != os.getuid()
+        or stat.S_IMODE(parent_info.st_mode) & 0o077
+    ):
+        raise ValueError(
+            "primary-ready marker parent must be a private user-owned "
+            "non-symlink directory"
+        )
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return path
+    raise FileExistsError(
+        f"refusing to reuse stale primary-ready marker destination: {path}"
+    )
+
+
+def _write_all(fd: int, payload: bytes) -> None:
+    offset = 0
+    while offset < len(payload):
+        written = os.write(fd, payload[offset:])
+        if written <= 0:
+            raise OSError("short write while publishing W&B primary-ready marker")
+        offset += written
+
+
+def _publish_primary_ready_marker(
+    path: Path | None,
+    identity: dict[str, str | int] | None,
+    *,
+    actual_run_id: str,
+) -> None:
+    """Atomically install one fsynced, no-replace primary ownership marker."""
+
+    if path is None or identity is None:
+        return
+    if actual_run_id != identity["run_id"]:
+        raise RuntimeError(
+            "W&B returned a run ID that disagrees with the primary-ready identity"
+        )
+
+    payload = (
+        json.dumps(identity, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+    temporary = path.parent / (
+        f".{path.name}.tmp-{os.getpid()}-{secrets.token_hex(8)}"
+    )
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(temporary, flags, 0o600)
+    installed = False
+    try:
+        os.fchmod(fd, 0o600)
+        _write_all(fd, payload)
+        os.fsync(fd)
+        os.close(fd)
+        fd = -1
+        # Hard-link installation is atomic and, unlike os.replace, never
+        # overwrites a stale/tampered destination. The temp inode was fully
+        # written and fsynced before it became visible at the final path.
+        os.link(temporary, path, follow_symlinks=False)
+        installed = True
+        temporary.unlink()
+        directory_fd = os.open(
+            path.parent,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
+        )
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+    if not installed:
+        raise RuntimeError("W&B primary-ready marker was not installed")
+    marker_info = path.lstat()
+    if (
+        not stat.S_ISREG(marker_info.st_mode)
+        or stat.S_IMODE(marker_info.st_mode) != 0o600
+        or marker_info.st_uid != os.getuid()
+    ):
+        raise RuntimeError(
+            "published W&B primary-ready marker failed its mode/owner audit"
+        )
+
+
 def _wandb_finish_timeout_seconds() -> float:
     """Keep distributed workers from holding GPU allocations during W&B teardown."""
     raw = os.environ.get(
@@ -123,10 +289,6 @@ def init_wandb_primary(args):
 
     offline = _is_offline_mode(args)
 
-    # Only perform explicit login when NOT offline
-    if (not offline) and args.wandb_key is not None:
-        wandb.login(key=args.wandb_key, host=args.wandb_host)
-
     # Prepare wandb init parameters
     # add random 6 length string with characters
     if args.wandb_random_suffix:
@@ -140,6 +302,12 @@ def init_wandb_primary(args):
         group=group,
         generated_name=generated_name,
     )
+    marker_identity = _primary_ready_marker_identity(args, group=group)
+    marker_path = _prepare_primary_ready_marker(marker_identity)
+
+    # Reject a stale/tampered marker locally before any W&B network call.
+    if (not offline) and args.wandb_key is not None:
+        wandb.login(key=args.wandb_key, host=args.wandb_host)
 
     # Prepare wandb init parameters
     init_kwargs = {
@@ -180,9 +348,20 @@ def init_wandb_primary(args):
         init_kwargs["dir"] = args.wandb_dir
         logger.info(f"W&B logs will be stored in: {args.wandb_dir}")
 
-    wandb.init(**init_kwargs)
+    primary_run = wandb.init(**init_kwargs)
 
     _init_wandb_common(args)
+
+    if marker_path is not None:
+        actual_run_id = str(getattr(primary_run, "id", "") or "")
+        if not actual_run_id and wandb.run is not None:
+            actual_run_id = str(getattr(wandb.run, "id", "") or "")
+        _publish_primary_ready_marker(
+            marker_path,
+            marker_identity,
+            actual_run_id=actual_run_id,
+        )
+        logger.info("Published W&B primary-ready marker: %s", marker_path)
 
     # Set wandb_run_id in args for easy access throughout the training process
     args.wandb_run_id = wandb.run.id
