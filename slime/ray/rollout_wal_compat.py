@@ -23,11 +23,13 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 OPT_IN_ENV = "SLIME_ROLLOUT_MANAGER_WAL_COMPAT_LEGACY_GIT_COMMIT"
+SERIALIZED_OPT_IN_ENV = "TMAX_SLIME_ROLLOUT_MANAGER_WAL_COMPAT_LEGACY_GIT_COMMIT"
 SLIME_GIT_COMMIT_ENV = "TMAX_SLIME_GIT_COMMIT"
 SLIME_RUNTIME_GIT_COMMIT_ENV = "TMAX_SLIME_RUNTIME_GIT_COMMIT"
 
 AUDITED_LEGACY_GIT_COMMIT = "77c6d526d740dc31f6bdd3177ac247b43ea1ce87"
 AUDITED_RUNTIME_GIT_COMMIT = "372025f1200ad83c6e5d5c5610387a17c31ea581"
+AUDITED_COMPAT_GIT_COMMIT = "e1becf877012c5094551dc9479c09a7bdcf5730a"
 AUDITED_RUNTIME_PATCH_SHA256 = "b3f9e7cf007683b8c50c01685c270c07e20d472414fbed8f7e47bceacff434c9"
 
 _AUDITED_RUNTIME_DIFF = frozenset(
@@ -104,10 +106,21 @@ def rollout_manager_wal_compat_env(
     """
 
     env = os.environ if environ is None else environ
-    legacy_revision = env.get(OPT_IN_ENV)
+    direct_revision = env.get(OPT_IN_ENV)
+    serialized_revision = env.get(SERIALIZED_OPT_IN_ENV)
+    if (
+        direct_revision is not None
+        and serialized_revision is not None
+        and direct_revision != serialized_revision
+    ):
+        raise RolloutWalCompatibilityError(
+            f"conflicting compatibility identities in {OPT_IN_ENV} and {SERIALIZED_OPT_IN_ENV}"
+        )
+    legacy_revision = direct_revision or serialized_revision
     if legacy_revision is None:
         return {}
-    _require_equal(OPT_IN_ENV, legacy_revision, AUDITED_LEGACY_GIT_COMMIT)
+    requested_by = OPT_IN_ENV if direct_revision is not None else SERIALIZED_OPT_IN_ENV
+    _require_equal(requested_by, legacy_revision, AUDITED_LEGACY_GIT_COMMIT)
 
     root = _repository_root() if repo_root is None else Path(repo_root)
     actual_revision = _git_text(root, "rev-parse", "--verify", "HEAD")
@@ -131,7 +144,15 @@ def rollout_manager_wal_compat_env(
         )
 
     actual_parent = _git_text(root, "rev-parse", "--verify", "HEAD^")
-    _require_equal("compatibility runtime parent", actual_parent, AUDITED_RUNTIME_GIT_COMMIT)
+    _require_equal("compatibility runtime parent", actual_parent, AUDITED_COMPAT_GIT_COMMIT)
+
+    compat_parent = _git_text(
+        root,
+        "rev-parse",
+        "--verify",
+        f"{AUDITED_COMPAT_GIT_COMMIT}^",
+    )
+    _require_equal("serialized compatibility parent", compat_parent, AUDITED_RUNTIME_GIT_COMMIT)
 
     audited_parent = _git_text(
         root,

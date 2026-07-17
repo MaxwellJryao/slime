@@ -27,7 +27,12 @@ def _successful_git_outputs(actual_revision: str = "a" * 40) -> dict[tuple[str, 
     return {
         ("rev-parse", "--verify", "HEAD"): f"{actual_revision}\n".encode(),
         ("status", "--porcelain", "--untracked-files=all"): b"",
-        ("rev-parse", "--verify", "HEAD^"): f"{compat.AUDITED_RUNTIME_GIT_COMMIT}\n".encode(),
+        ("rev-parse", "--verify", "HEAD^"): f"{compat.AUDITED_COMPAT_GIT_COMMIT}\n".encode(),
+        (
+            "rev-parse",
+            "--verify",
+            f"{compat.AUDITED_COMPAT_GIT_COMMIT}^",
+        ): f"{compat.AUDITED_RUNTIME_GIT_COMMIT}\n".encode(),
         (
             "rev-parse",
             "--verify",
@@ -96,6 +101,36 @@ def test_compatibility_returns_actor_local_legacy_and_actual_identities(monkeypa
     }
     assert env[compat.SLIME_GIT_COMMIT_ENV] == actual_revision
     assert compat.SLIME_RUNTIME_GIT_COMMIT_ENV not in env
+
+
+@pytest.mark.unit
+def test_serialized_opt_in_returns_actor_local_overrides(monkeypatch) -> None:
+    actual_revision = "a" * 40
+    outputs = _successful_git_outputs(actual_revision)
+    _install_git_stub(monkeypatch, outputs)
+    env = {
+        compat.SERIALIZED_OPT_IN_ENV: compat.AUDITED_LEGACY_GIT_COMMIT,
+        compat.SLIME_GIT_COMMIT_ENV: actual_revision,
+    }
+
+    assert compat.rollout_manager_wal_compat_env(
+        environ=env,
+        repo_root=Path("/runtime"),
+    ) == {
+        compat.SLIME_GIT_COMMIT_ENV: compat.AUDITED_LEGACY_GIT_COMMIT,
+        compat.SLIME_RUNTIME_GIT_COMMIT_ENV: actual_revision,
+    }
+
+
+@pytest.mark.unit
+def test_conflicting_direct_and_serialized_opt_ins_fail_closed() -> None:
+    env = {
+        compat.OPT_IN_ENV: compat.AUDITED_LEGACY_GIT_COMMIT,
+        compat.SERIALIZED_OPT_IN_ENV: "b" * 40,
+    }
+
+    with pytest.raises(compat.RolloutWalCompatibilityError, match="conflicting"):
+        compat.rollout_manager_wal_compat_env(environ=env, repo_root=Path("/runtime"))
 
 
 @pytest.mark.unit
