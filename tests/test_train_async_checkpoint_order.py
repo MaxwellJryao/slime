@@ -154,6 +154,9 @@ class _ActorModel:
     def save_model(self, rollout_id, force_sync=False):
         self._events.append(("model-save", rollout_id, force_sync))
 
+    def finish_tracking(self):
+        self._events.append(("trainer-finish", None))
+
 
 def test_rollout_state_precedes_training_and_model_commit(monkeypatch, tmp_path):
     events = []
@@ -212,10 +215,10 @@ def test_rollout_state_precedes_training_and_model_commit(monkeypatch, tmp_path)
     )
     monkeypatch.setattr(train_async, "init_tracking", lambda _args: None)
     monkeypatch.setattr(
-        train_async,
+        train_async.logging_utils,
         "finish_tracking",
-        lambda _args, *, raise_on_error=False: events.append(
-            ("primary-finish", raise_on_error)
+        lambda _args, *, raise_on_error=False, exit_code=None: events.append(
+            ("primary-finish", raise_on_error, exit_code)
         ),
     )
     monkeypatch.setattr(
@@ -273,9 +276,11 @@ def test_rollout_state_precedes_training_and_model_commit(monkeypatch, tmp_path)
         for index, event in enumerate(events)
         if event[0] == "primary-log" and event[1] == "eval/train_step"
     )
-    checked_finish_index = events.index(("primary-finish", True))
+    checked_finish_index = events.index(("primary-finish", True, 0))
     assert final_eval_event_index < final_log_index
-    assert final_log_index < checked_finish_index
+    assert final_log_index < names.index("trainer-finish")
+    assert names.index("trainer-finish") < names.index("dispose")
+    assert names.index("dispose") < checked_finish_index
     assert checked_finish_index < names.index("final-eval-marker")
     assert names.index("final-eval-marker") < names.index("training-marker")
     assert ("eval-require-complete", 0, True) in events
@@ -405,9 +410,9 @@ def _patch_resume_runtime(
     )
     monkeypatch.setattr(train_async, "init_tracking", lambda _args: None)
     monkeypatch.setattr(
-        train_async,
+        train_async.logging_utils,
         "finish_tracking",
-        lambda _args, *, raise_on_error=False: None,
+        lambda _args, *, raise_on_error=False, exit_code=None: None,
     )
     monkeypatch.setattr(train_async.ray, "get", lambda value, **_kwargs: value)
 
@@ -626,9 +631,9 @@ def test_failed_primary_final_eval_flush_writes_no_completion_marker(
     args = _resume_args(tmp_path)
     _patch_resume_runtime(monkeypatch, events, rollout_manager, _ActorModel(events))
     monkeypatch.setattr(
-        train_async,
+        train_async.logging_utils,
         "finish_tracking",
-        lambda _args, *, raise_on_error=False: (
+        lambda _args, *, raise_on_error=False, exit_code=None: (
             (_ for _ in ()).throw(RuntimeError("primary flush failed"))
             if raise_on_error
             else None
@@ -779,6 +784,32 @@ def test_failed_actor_batch_never_commits_prefetched_metrics(monkeypatch):
         train_async.train(args)
 
     assert ("metrics-commit", 0) not in events
+
+
+def test_async_entrypoint_marks_primary_failed_without_masking_training_error(
+    monkeypatch,
+):
+    args = SimpleNamespace(use_wandb=True)
+    finishes = []
+    monkeypatch.setattr(train_async, "parse_args", lambda: args)
+    monkeypatch.setattr(
+        train_async,
+        "train",
+        lambda _args: (_ for _ in ()).throw(RuntimeError("provider failed")),
+    )
+    monkeypatch.setattr(
+        train_async.logging_utils,
+        "finish_tracking",
+        lambda observed_args, *, raise_on_error=False, exit_code=None: (
+            finishes.append((observed_args, raise_on_error, exit_code))
+            or (_ for _ in ()).throw(RuntimeError("tracking teardown failed"))
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="provider failed"):
+        train_async.main()
+
+    assert finishes == [(args, False, 1)]
 
 
 if __name__ == "__main__":

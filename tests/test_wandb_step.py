@@ -720,6 +720,41 @@ def test_secondary_wandb_writer_disables_console_capture(monkeypatch, mode):
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize(
+    ("role", "expected_label"),
+    [("actor", "trainer-actor"), ("critic", "trainer-critic")],
+)
+def test_trainer_secondary_cannot_update_shared_run_finish_state(
+    monkeypatch, role, expected_label
+):
+    args = Namespace(
+        use_wandb=True,
+        wandb_run_id="run-id",
+        wandb_mode="online",
+        wandb_key=None,
+        wandb_host=None,
+        wandb_team="team",
+        wandb_project="project",
+        wandb_dir=None,
+    )
+    initialized = []
+    monkeypatch.setattr(wandb_utils.wandb, "Settings", lambda **kwargs: kwargs)
+    monkeypatch.setattr(
+        wandb_utils.wandb,
+        "init",
+        lambda **kwargs: initialized.append(kwargs),
+    )
+    monkeypatch.setattr(wandb_utils, "_init_wandb_common", lambda _args: None)
+
+    wandb_utils.init_wandb_secondary(args, role=role)
+
+    settings = initialized[0]["settings"]
+    assert settings["x_label"] == expected_label
+    assert settings["x_primary"] is False
+    assert settings["x_update_finish_state"] is False
+
+
+@pytest.mark.unit
 def test_primary_online_writer_uses_server_summary_and_unique_label(monkeypatch):
     args = Namespace(
         use_wandb=True,

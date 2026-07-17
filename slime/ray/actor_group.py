@@ -1,4 +1,5 @@
 import logging
+import math
 import os
 from pathlib import Path
 from time import perf_counter
@@ -12,6 +13,38 @@ from slime.utils import logging_utils
 from slime.utils.metric_utils import set_wandb_step
 
 logger = logging.getLogger(__name__)
+
+_DEFAULT_TRAINER_TRACKING_FINISH_TIMEOUT_SECONDS = 45.0
+_MAX_TRAINER_TRACKING_FINISH_TIMEOUT_SECONDS = 120.0
+
+
+def _trainer_tracking_finish_timeout_seconds() -> float:
+    """Bound the driver wait around trainer-secondary W&B teardown."""
+
+    raw = os.environ.get(
+        "SLIME_TRAINER_TRACKING_FINISH_TIMEOUT_SECONDS",
+        str(_DEFAULT_TRAINER_TRACKING_FINISH_TIMEOUT_SECONDS),
+    )
+    try:
+        timeout = float(raw)
+    except ValueError:
+        timeout = None
+
+    if timeout is None or not math.isfinite(timeout) or timeout <= 0:
+        logger.warning(
+            "Invalid SLIME_TRAINER_TRACKING_FINISH_TIMEOUT_SECONDS=%r; using %.0fs",
+            raw,
+            _DEFAULT_TRAINER_TRACKING_FINISH_TIMEOUT_SECONDS,
+        )
+        return _DEFAULT_TRAINER_TRACKING_FINISH_TIMEOUT_SECONDS
+    if timeout > _MAX_TRAINER_TRACKING_FINISH_TIMEOUT_SECONDS:
+        logger.warning(
+            "SLIME_TRAINER_TRACKING_FINISH_TIMEOUT_SECONDS=%r exceeds the %.0fs safety cap; clamping it",
+            raw,
+            _MAX_TRAINER_TRACKING_FINISH_TIMEOUT_SECONDS,
+        )
+        return _MAX_TRAINER_TRACKING_FINISH_TIMEOUT_SECONDS
+    return timeout
 
 
 def _configure_tms_preload_env(env_vars: dict[str, str], dynlib_path: str | os.PathLike[str] | None = None) -> None:
@@ -243,6 +276,48 @@ class RayTrainGroup:
 
     def clear_memory(self):
         return ray.get([actor.clear_memory.remote() for actor in self._actor_handlers])
+
+    def finish_tracking(self) -> list[bool] | None:
+        """Finish this role's W&B secondary without holding GPUs indefinitely.
+
+        Every rank receives the RPC because the W&B logging rank depends on
+        the model-parallel layout.  MegatronTrainRayActor makes it a no-op on
+        non-owner ranks.  If the bounded wait expires, the group is terminal
+        and its actors are killed to release their GPU allocations; shutdown
+        can then continue with the other secondary writers and the primary.
+        """
+
+        if not getattr(self.args, "use_wandb", False):
+            return []
+
+        finish_refs = [
+            actor.finish_tracking.remote() for actor in self._actor_handlers
+        ]
+        timeout = _trainer_tracking_finish_timeout_seconds()
+        try:
+            return ray.get(finish_refs, timeout=timeout)
+        except ray.exceptions.GetTimeoutError:
+            logger.error(
+                "%s trainer tracking finish exceeded %.0fs; terminating %d terminal trainer actors",
+                self.role,
+                timeout,
+                len(self._actor_handlers),
+            )
+            for actor in self._actor_handlers:
+                try:
+                    ray.kill(actor, no_restart=True)
+                except Exception:
+                    logger.exception(
+                        "Failed to terminate a timed-out %s trainer actor",
+                        self.role,
+                    )
+            return None
+        except Exception:
+            # A failed secondary must not prevent the remaining secondaries or
+            # the primary writer from closing.  The caller continues the
+            # ordered shutdown after this method returns.
+            logger.exception("Failed to finish %s trainer tracking", self.role)
+            return None
 
     def set_rollout_manager(self, rollout_manager):
         return ray.get([actor.set_rollout_manager.remote(rollout_manager) for actor in self._actor_handlers])
