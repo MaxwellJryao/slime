@@ -10,6 +10,13 @@ NUM_GPUS = 0
 
 
 def test_get_values_does_not_apply_rollout_temperature(monkeypatch):
+    megatron_utils_name = "slime.backends.megatron_utils"
+    megatron_utils = sys.modules.get(megatron_utils_name)
+    missing = object()
+    previous_package_attributes = {
+        name: getattr(megatron_utils, name, missing) if megatron_utils is not None else missing
+        for name in ("loss", "cp_utils")
+    }
     previous_loss = sys.modules.pop("slime.backends.megatron_utils.loss", None)
     previous_cp_utils = sys.modules.pop("slime.backends.megatron_utils.cp_utils", None)
 
@@ -48,6 +55,17 @@ def test_get_values_does_not_apply_rollout_temperature(monkeypatch):
             sys.modules.pop("slime.backends.megatron_utils.cp_utils", None)
         else:
             sys.modules["slime.backends.megatron_utils.cp_utils"] = previous_cp_utils
+
+        # Importing a submodule also caches it on its parent package.  Restore
+        # those attributes together with sys.modules so this temporary MPU
+        # stub cannot leak into tests collected later in the same process.
+        megatron_utils = sys.modules.get(megatron_utils_name)
+        if megatron_utils is not None:
+            for name, previous in previous_package_attributes.items():
+                if previous is missing:
+                    vars(megatron_utils).pop(name, None)
+                else:
+                    setattr(megatron_utils, name, previous)
 
 
 if __name__ == "__main__":
