@@ -392,6 +392,14 @@ class MegatronTrainRayActor(TrainRayActor):
             self.train_actor(rollout_id, rollout_data, external_data=external_data)
             result = None
 
+            # ``sleep`` destroys reloadable Megatron process groups. Capture
+            # every distributed value needed by the post-sleep performance
+            # flush while those groups are still live.
+            perf_log_context = {
+                "is_primary_rank": is_megatron_main_rank(),
+                "world_size": dist.get_world_size(),
+            }
+
         if self.args.offload_train:
             del rollout_data
             self.sleep()
@@ -399,7 +407,7 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.role == "actor":
             # Flush only after the complete train call, including optional
             # wake/sleep offload phases, so nothing leaks into rollout N+1.
-            log_perf_data(rollout_id, self.args)
+            log_perf_data(rollout_id, self.args, **perf_log_context)
 
         return result
 

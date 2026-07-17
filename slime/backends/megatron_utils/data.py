@@ -497,17 +497,39 @@ def log_passrate(rollout_id: int, args: Namespace, rollout_data: RolloutBatch) -
         gather_log_data("passrate", args, rollout_id, log_dict)
 
 
-def log_perf_data(rollout_id: int, args: Namespace, extra_metrics: dict | None = None) -> None:
-    train_metric_utils.log_perf_data_raw(
-        rollout_id=rollout_id,
-        args=args,
-        is_primary_rank=(
+def log_perf_data(
+    rollout_id: int,
+    args: Namespace,
+    extra_metrics: dict | None = None,
+    *,
+    is_primary_rank: bool | None = None,
+    world_size: int | None = None,
+) -> None:
+    """Flush trainer performance telemetry for one completed rollout.
+
+    Offloaded trainers destroy their reloadable Megatron process groups before
+    this flush so the ``sleep`` phase is included in the same rollout's timing
+    metrics.  Callers in that lifecycle must capture ``is_primary_rank`` and
+    ``world_size`` while the groups are still live and pass them explicitly.
+    The optional fallbacks preserve the historical behavior for callers that
+    flush while distributed state is available.
+    """
+
+    if is_primary_rank is None:
+        is_primary_rank = (
             mpu.get_tensor_model_parallel_rank() == 0
             and mpu.is_pipeline_last_stage()
             and mpu.get_data_parallel_rank(with_context_parallel=True) == 0
-        ),
+        )
+    if world_size is None:
+        world_size = dist.get_world_size()
+
+    train_metric_utils.log_perf_data_raw(
+        rollout_id=rollout_id,
+        args=args,
+        is_primary_rank=is_primary_rank,
         compute_total_fwd_flops=lambda seq_lens: calculate_fwd_flops(seqlens=seq_lens, args=args)
-        / dist.get_world_size()
+        / world_size
         / 1e12,
         extra_metrics=extra_metrics,
     )
