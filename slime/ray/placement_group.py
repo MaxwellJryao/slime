@@ -7,6 +7,7 @@ from ray.util.placement_group import placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from .actor_group import RayTrainGroup
+from .rollout_wal_compat import rollout_manager_wal_compat_env
 from .utils import add_default_ray_env_vars
 
 logger = logging.getLogger(__name__)
@@ -269,10 +270,14 @@ def create_rollout_manager(args, pg, *, wait_ready: bool = True):
             "or offload_rollout; those startup operations require a ready engine set"
         )
 
+    # Keep any legacy WAL identity scoped to this one Ray actor.  In
+    # particular, do not mutate os.environ: Megatron trainers must retain the
+    # actual immutable Slime revision for provenance and source locking.
+    rollout_manager_env = add_default_ray_env_vars(rollout_manager_wal_compat_env())
     rollout_manager_options = {
         "num_cpus": 1,
         "num_gpus": 0,
-        "runtime_env": {"env_vars": add_default_ray_env_vars()},
+        "runtime_env": {"env_vars": rollout_manager_env},
     }
     if getattr(args, "rollout_data_transport", "object-store") == "nixl":
         rollout_manager_options["enable_tensor_transport"] = True
