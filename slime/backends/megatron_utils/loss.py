@@ -31,6 +31,9 @@ from .cp_utils import (
     all_gather_with_cp,
     get_logits_and_tokens_offset_with_cp,
     get_sum_of_sample_mean,
+    masked_explained_variance_train_metric_stats,
+    masked_mean_train_metric_stats,
+    masked_root_mean_square_train_metric_stats,
     slice_log_prob_with_cp,
 )
 
@@ -38,6 +41,44 @@ ROLLOUT_TOP_P_TOKEN_KEYS = (
     "rollout_top_p_token_ids",
     "rollout_top_p_token_offsets",
 )
+
+SAO_POLICY_OBSERVABILITY_METRICS = (
+    "sao_behavior_logprob_mean",
+    "sao_current_logprob_mean",
+    "sao_behavior_current_log_ratio_mean",
+    "sao_behavior_current_log_ratio_abs_mean",
+    "sao_behavior_current_approx_kl_k2",
+)
+
+CRITIC_OBSERVABILITY_METRICS = (
+    "value_mae",
+    "value_rmse",
+    "value_residual_bias",
+    "value_explained_variance",
+)
+
+
+def _local_response_loss_mask(batch: RolloutBatch, reference: torch.Tensor) -> torch.Tensor:
+    """Return the loss mask in the same response-token layout as ``reference``."""
+
+    loss_masks = batch["loss_masks"]
+    if mpu.get_context_parallel_world_size() > 1:
+        loss_masks = [
+            slice_log_prob_with_cp(mask, total_length, response_length)
+            for mask, total_length, response_length in zip(
+                loss_masks,
+                batch["total_lengths"],
+                batch["response_lengths"],
+                strict=True,
+            )
+        ]
+    local_mask = torch.cat(loss_masks, dim=0).to(device=reference.device)
+    if local_mask.numel() != reference.numel():
+        raise ValueError(
+            "Local response loss mask and response values must align, "
+            f"got {local_mask.numel()} mask entries and {reference.numel()} values"
+        )
+    return local_mask
 
 
 def get_rollout_top_p_logprob_kwargs(args: Namespace, batch: dict[str, Any]) -> dict[str, Any]:
@@ -993,21 +1034,12 @@ def policy_loss_function(
 
     dppo_divergence = None
     sao_dis_metrics = None
+    sao_observability_stats: dict[str, torch.Tensor] = {}
     if getattr(args, "policy_loss_type", "ppo") == "sao_dis":
         # Full response masks must follow the same CP zig-zag slicing as the
         # current and behavior log probabilities before they can be aligned.
-        local_response_masks = batch["loss_masks"]
-        if mpu.get_context_parallel_world_size() > 1:
-            local_response_masks = [
-                slice_log_prob_with_cp(mask, total_length, response_length)
-                for mask, total_length, response_length in zip(
-                    local_response_masks,
-                    total_lengths,
-                    response_lengths,
-                    strict=True,
-                )
-            ]
-        response_mask = torch.cat(local_response_masks, dim=0).bool()
+        local_response_mask = _local_response_loss_mask(batch, log_probs)
+        response_mask = local_response_mask.bool()
         pg_loss, below, above, retained_ratio = compute_sao_dis_loss(
             behavior_log_probs=old_log_probs,
             policy_log_probs=log_probs,
@@ -1024,6 +1056,46 @@ def policy_loss_function(
             "sao_dis_masked_frac": pg_clipfrac,
             "sao_dis_effective_frac": response_mask.to(log_probs.dtype) - pg_clipfrac,
         }
+        # These are true loss-mask-weighted token diagnostics, independent of
+        # rollout grouping and microbatch/DP/CP partitioning. Keep additive
+        # float64 sufficient statistics here; the global reducer emits the
+        # named W&B metrics only after its DP x CP all-reduce.
+        behavior_current_log_ratio = old_log_probs.to(torch.float64) - log_probs.to(torch.float64)
+        sao_observability_stats.update(
+            masked_mean_train_metric_stats(
+                "sao_behavior_logprob_mean",
+                old_log_probs,
+                local_response_mask,
+            )
+        )
+        sao_observability_stats.update(
+            masked_mean_train_metric_stats(
+                "sao_current_logprob_mean",
+                log_probs,
+                local_response_mask,
+            )
+        )
+        sao_observability_stats.update(
+            masked_mean_train_metric_stats(
+                "sao_behavior_current_log_ratio_mean",
+                behavior_current_log_ratio,
+                local_response_mask,
+            )
+        )
+        sao_observability_stats.update(
+            masked_mean_train_metric_stats(
+                "sao_behavior_current_log_ratio_abs_mean",
+                behavior_current_log_ratio.abs(),
+                local_response_mask,
+            )
+        )
+        sao_observability_stats.update(
+            masked_mean_train_metric_stats(
+                "sao_behavior_current_approx_kl_k2",
+                0.5 * behavior_current_log_ratio.square(),
+                local_response_mask,
+            )
+        )
     elif getattr(args, "policy_loss_type", "ppo") == "dppo":
         response_mask = torch.cat(batch["loss_masks"], dim=0).bool()
         pg_loss, pg_clipfrac, dppo_divergence = compute_dppo_loss(
@@ -1150,6 +1222,8 @@ def policy_loss_function(
         for metric_name, metric_value in sao_dis_metrics.items():
             reported_loss[metric_name] = sum_of_sample_mean(metric_value).clone().detach()
 
+    reported_loss.update(sao_observability_stats)
+
     if train_rollout_logprob_abs_diff is not None:
         reported_loss["train_rollout_logprob_abs_diff"] = train_rollout_logprob_abs_diff.clone().detach()
 
@@ -1197,7 +1271,9 @@ def value_loss_function(
 
     Returns:
         Tuple of `(loss, metrics)` where `loss` is a scalar tensor and
-        `metrics` contains detached scalars "value_loss" and "value_clipfrac".
+        `metrics` contains detached loss scalars plus additive sufficient
+        statistics for globally reduced value MAE, RMSE, residual bias, and
+        explained variance.
     """
     old_values = torch.cat(batch["values"], dim=0)
 
@@ -1211,6 +1287,8 @@ def value_loss_function(
     values = torch.cat([value.flatten() for value in values["values"]], dim=0)
 
     returns = torch.cat(batch["returns"], dim=0)
+    local_response_mask = _local_response_loss_mask(batch, values)
+    residual = values - returns
 
     values_clipfrac = torch.abs(values - old_values) > args.value_clip
     values_clipped = old_values + (values - old_values).clamp(-args.value_clip, args.value_clip)
@@ -1229,6 +1307,17 @@ def value_loss_function(
         "value_loss": loss.clone().detach(),
         "value_clipfrac": values_clipfrac.clone().detach(),
     }
+    reported_loss.update(masked_mean_train_metric_stats("value_mae", residual.abs(), local_response_mask))
+    reported_loss.update(masked_root_mean_square_train_metric_stats("value_rmse", residual, local_response_mask))
+    reported_loss.update(masked_mean_train_metric_stats("value_residual_bias", residual, local_response_mask))
+    reported_loss.update(
+        masked_explained_variance_train_metric_stats(
+            "value_explained_variance",
+            predictions=values,
+            targets=returns,
+            loss_mask=local_response_mask,
+        )
+    )
 
     return loss, reported_loss
 
@@ -1375,12 +1464,23 @@ def loss_function(
             # so we leave a 0 placeholder here and let ``train_one_step``
             # substitute the constant directly, instead of routing it through
             # per-mb fractions.
-            "values": torch.tensor(
+            # A tiny float64 vector is intentional: the hidden sufficient
+            # statistics include second moments whose cancellation error can
+            # otherwise dominate explained variance on long trajectories.
+            "values": torch.stack(
                 [
-                    num_tokens if args.calculate_per_token_loss else 0,
+                    torch.as_tensor(
+                        num_tokens if args.calculate_per_token_loss else 0,
+                        device=logits.device,
+                        dtype=torch.float64,
+                    )
+                    .detach()
+                    .reshape(())
                 ]
-                + list(log.values()),
-                device=logits.device,
+                + [
+                    torch.as_tensor(value, device=logits.device, dtype=torch.float64).detach().reshape(())
+                    for value in log.values()
+                ]
             ),
         },
     )

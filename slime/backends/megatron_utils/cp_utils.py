@@ -1,9 +1,202 @@
+import math
+from collections import defaultdict
 from collections.abc import Callable
 
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from megatron.core import mpu
+
+_TRAIN_METRIC_STAT_PREFIX = "__train_metric_stat__:"
+_TRAIN_METRIC_REDUCTIONS = frozenset({"mean", "root_mean_square", "explained_variance"})
+
+
+def train_metric_stat_key(reduction: str, metric_name: str, stat_name: str) -> str:
+    """Encode an additive sufficient statistic in a loss-log key.
+
+    Megatron returns one loss-log vector per microbatch and later sums those
+    vectors over microbatches and the DP x CP group.  Non-linear metrics such
+    as RMSE and explained variance therefore cannot be computed inside the
+    loss function: averaging per-microbatch values gives a partition-dependent
+    answer.  Keys produced here remain internal to that vector.  The final
+    reducer consumes them and emits only ``metric_name``.
+    """
+
+    if reduction not in _TRAIN_METRIC_REDUCTIONS:
+        raise ValueError(f"Unsupported train metric reduction: {reduction!r}")
+    for label, value in (("metric_name", metric_name), ("stat_name", stat_name)):
+        if not value or ":" in value:
+            raise ValueError(f"{label} must be non-empty and may not contain ':', got {value!r}")
+    return f"{_TRAIN_METRIC_STAT_PREFIX}{reduction}:{metric_name}:{stat_name}"
+
+
+def _masked_observations(
+    values: torch.Tensor,
+    loss_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return selected observations and weights in float64.
+
+    Indexing before arithmetic is intentional: a masked-out diagnostic value
+    (including an infinity from padding or an unused CP shard) must contribute
+    exactly zero rather than producing ``0 * inf == nan``.  Float64 keeps the
+    small all-reduced statistic vectors accurate for long trajectories.
+    """
+
+    values = values.detach().reshape(-1)
+    loss_mask = loss_mask.detach().reshape(-1).to(device=values.device)
+    if values.numel() != loss_mask.numel():
+        raise ValueError(
+            "values and loss_mask must contain the same number of elements, "
+            f"got {values.numel()} and {loss_mask.numel()}"
+        )
+    selected = loss_mask > 0
+    return values[selected].to(dtype=torch.float64), loss_mask[selected].to(dtype=torch.float64)
+
+
+def masked_mean_train_metric_stats(
+    metric_name: str,
+    values: torch.Tensor,
+    loss_mask: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    """Build additive stats for a loss-mask-weighted global mean."""
+
+    selected_values, weights = _masked_observations(values, loss_mask)
+    return {
+        train_metric_stat_key("mean", metric_name, "weighted_sum"): (selected_values * weights).sum(),
+        train_metric_stat_key("mean", metric_name, "weight"): weights.sum(),
+    }
+
+
+def masked_root_mean_square_train_metric_stats(
+    metric_name: str,
+    values: torch.Tensor,
+    loss_mask: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    """Build additive stats for a loss-mask-weighted global RMS."""
+
+    selected_values, weights = _masked_observations(values, loss_mask)
+    return {
+        train_metric_stat_key("root_mean_square", metric_name, "weighted_sum_squares"): (
+            selected_values.square() * weights
+        ).sum(),
+        train_metric_stat_key("root_mean_square", metric_name, "weight"): weights.sum(),
+    }
+
+
+def masked_explained_variance_train_metric_stats(
+    metric_name: str,
+    predictions: torch.Tensor,
+    targets: torch.Tensor,
+    loss_mask: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    """Build global moments for ``1 - Var(target - prediction) / Var(target)``.
+
+    Both target and residual moments are required.  A local explained variance
+    is not additive and must never be averaged across microbatches or ranks.
+    """
+
+    selected_predictions, weights = _masked_observations(predictions, loss_mask)
+    selected_targets, _ = _masked_observations(targets, loss_mask)
+    residuals = selected_predictions - selected_targets
+    reduction = "explained_variance"
+    return {
+        train_metric_stat_key(reduction, metric_name, "weight"): weights.sum(),
+        train_metric_stat_key(reduction, metric_name, "target_weighted_sum"): (selected_targets * weights).sum(),
+        train_metric_stat_key(reduction, metric_name, "target_weighted_sum_squares"): (
+            selected_targets.square() * weights
+        ).sum(),
+        train_metric_stat_key(reduction, metric_name, "residual_weighted_sum"): (residuals * weights).sum(),
+        train_metric_stat_key(reduction, metric_name, "residual_weighted_sum_squares"): (
+            residuals.square() * weights
+        ).sum(),
+    }
+
+
+def _parse_train_metric_stat_key(key: str) -> tuple[str, str, str] | None:
+    if not key.startswith(_TRAIN_METRIC_STAT_PREFIX):
+        return None
+    fields = key[len(_TRAIN_METRIC_STAT_PREFIX) :].split(":")
+    if len(fields) != 3:
+        raise ValueError(f"Malformed train metric sufficient-stat key: {key!r}")
+    reduction, metric_name, stat_name = fields
+    if reduction not in _TRAIN_METRIC_REDUCTIONS or not metric_name or not stat_name:
+        raise ValueError(f"Malformed train metric sufficient-stat key: {key!r}")
+    return reduction, metric_name, stat_name
+
+
+def _require_stats(
+    metric_name: str,
+    reduction: str,
+    stats: dict[str, float],
+    required: set[str],
+) -> None:
+    actual = set(stats)
+    if actual != required:
+        raise ValueError(
+            f"Train metric {metric_name!r} ({reduction}) requires stats {sorted(required)}, " f"got {sorted(actual)}"
+        )
+
+
+def _nonnegative_centered_sum_squares(weight: float, weighted_sum: float, weighted_sum_squares: float) -> float:
+    """Return a numerically guarded weighted centered sum of squares."""
+
+    centered = weighted_sum_squares - weighted_sum * weighted_sum / weight
+    # Round-off can make an exactly constant vector very slightly negative.
+    scale = max(abs(weighted_sum_squares), abs(weighted_sum * weighted_sum / weight), 1.0)
+    tolerance = 64.0 * float(torch.finfo(torch.float64).eps) * scale
+    if centered < 0.0 and centered >= -tolerance:
+        return 0.0
+    return max(centered, 0.0)
+
+
+def _derive_train_metric(reduction: str, metric_name: str, stats: dict[str, float]) -> float:
+    if reduction == "mean":
+        _require_stats(metric_name, reduction, stats, {"weighted_sum", "weight"})
+        weight = stats["weight"]
+        return stats["weighted_sum"] / weight if weight > 0.0 else 0.0
+
+    if reduction == "root_mean_square":
+        _require_stats(metric_name, reduction, stats, {"weighted_sum_squares", "weight"})
+        weight = stats["weight"]
+        if weight <= 0.0:
+            return 0.0
+        return math.sqrt(max(stats["weighted_sum_squares"] / weight, 0.0))
+
+    if reduction == "explained_variance":
+        _require_stats(
+            metric_name,
+            reduction,
+            stats,
+            {
+                "weight",
+                "target_weighted_sum",
+                "target_weighted_sum_squares",
+                "residual_weighted_sum",
+                "residual_weighted_sum_squares",
+            },
+        )
+        weight = stats["weight"]
+        if weight <= 0.0:
+            return 0.0
+        target_ss = _nonnegative_centered_sum_squares(
+            weight,
+            stats["target_weighted_sum"],
+            stats["target_weighted_sum_squares"],
+        )
+        residual_ss = _nonnegative_centered_sum_squares(
+            weight,
+            stats["residual_weighted_sum"],
+            stats["residual_weighted_sum_squares"],
+        )
+        target_scale = max(abs(stats["target_weighted_sum_squares"]), 1.0)
+        zero_variance_tolerance = 64.0 * float(torch.finfo(torch.float64).eps) * target_scale
+        if target_ss <= zero_variance_tolerance:
+            # Finite force-finite semantics: a constant target has EV=1 when
+            # the residual is also constant (explained up to bias), else 0.
+            return 1.0 if residual_ss <= zero_variance_tolerance else 0.0
+        return 1.0 - residual_ss / target_ss
+
+    raise AssertionError(f"Unhandled train metric reduction: {reduction}")
 
 
 def get_logits_and_tokens_offset_with_cp(
@@ -154,6 +347,8 @@ def reduce_train_step_metrics(
     keys = losses_reduced[0]["keys"]
     values = None
     for x in losses_reduced:
+        if x["keys"] != keys:
+            raise ValueError("Every microbatch must report the same ordered train metric keys")
         values = x["values"] if values is None else values + x["values"]
     assert len(keys) + 1 == values.numel()
     dist.all_reduce(values, group=dp_with_cp_group)
@@ -165,7 +360,24 @@ def reduce_train_step_metrics(
     else:
         num_samples_or_tokens = step_global_batch_size
         cp_factor = 1
-    return {key: value * cp_factor / num_samples_or_tokens for key, value in zip(keys, values[1:], strict=False)}
+    reduced: dict[str, float] = {}
+    sufficient_stats: dict[tuple[str, str], dict[str, float]] = defaultdict(dict)
+    for key, value in zip(keys, values[1:], strict=False):
+        parsed = _parse_train_metric_stat_key(key)
+        if parsed is None:
+            reduced[key] = value * cp_factor / num_samples_or_tokens
+            continue
+        reduction, metric_name, stat_name = parsed
+        metric_stats = sufficient_stats[(reduction, metric_name)]
+        if stat_name in metric_stats:
+            raise ValueError(f"Duplicate sufficient statistic {stat_name!r} for train metric {metric_name!r}")
+        metric_stats[stat_name] = value
+
+    for (reduction, metric_name), metric_stats in sufficient_stats.items():
+        if metric_name in reduced:
+            raise ValueError(f"Derived train metric collides with an ordinary metric: {metric_name!r}")
+        reduced[metric_name] = _derive_train_metric(reduction, metric_name, metric_stats)
+    return reduced
 
 
 def rollout_log_metric_contribution(
