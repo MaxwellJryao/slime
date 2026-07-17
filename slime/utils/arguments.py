@@ -1784,7 +1784,14 @@ def _apply_megatron_role_overrides(base_args, overrides, role):
         # Critic-specific: disable features that only apply to actors.
         role_args.kl_coef = 0
         role_args.use_opd = False
-        role_args.custom_advantage_function_path = None
+        # SAO's critic and actor must construct targets from the same
+        # skip-observation reward stream.  A custom SAO advantage function
+        # therefore remains active on the critic; clearing it here would train
+        # the value head against the built-in scalar-only return while the
+        # actor consumes custom token rewards.  Historical non-SAO role
+        # behavior is unchanged.
+        if getattr(role_args, "policy_loss_type", "ppo") != "sao_dis":
+            role_args.custom_advantage_function_path = None
         role_args.untie_embeddings_and_output_weights = True
         if "disable_param_buffers_cpu_backup" not in overrides:
             role_args.disable_param_buffers_cpu_backup = False
@@ -2000,8 +2007,13 @@ def slime_validate_args(args):
             raise ValueError("--policy-loss-type=sao_dis cannot be combined with --use-opsm")
         if args.use_tis or args.get_mismatch_metrics:
             raise ValueError("--policy-loss-type=sao_dis cannot be combined with TIS/mismatch loss transforms")
-        if getattr(args, "custom_advantage_function_path", None) is not None:
-            raise ValueError("--policy-loss-type=sao_dis requires the built-in skip-observation GAE")
+        custom_advantage_path = getattr(args, "custom_advantage_function_path", None)
+        if custom_advantage_path is not None and (
+            not isinstance(custom_advantage_path, str) or not custom_advantage_path.strip()
+        ):
+            raise ValueError(
+                "--policy-loss-type=sao_dis custom advantage path must be a non-empty import path"
+            )
 
         eps_low = getattr(args, "sao_dis_eps_low", 0.3)
         eps_high = getattr(args, "sao_dis_eps_high", 5.0)

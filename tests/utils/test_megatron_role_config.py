@@ -89,6 +89,35 @@ class TestMegatronRoleConfig:
         assert critic_args.kl_coef == 0
         assert critic_args.use_opd is False
 
+    def test_sao_critic_retains_custom_advantage_function(self):
+        from slime.utils.arguments import parse_megatron_role_args
+
+        path = _write_yaml(
+            {
+                "megatron": [
+                    {
+                        "name": "default",
+                        "role": "critic",
+                        "overrides": {},
+                    },
+                ]
+            }
+        )
+        args = _base_args(
+            policy_loss_type="sao_dis",
+            critic_train_epochs=2,
+            custom_advantage_function_path=(
+                "polar.process_reward.compute_advantages"
+            ),
+        )
+
+        critic_args = parse_megatron_role_args(args, path, role="critic")
+
+        assert (
+            critic_args.custom_advantage_function_path
+            == "polar.process_reward.compute_advantages"
+        )
+
     def test_role_override_rejects_scalar_freeze_pattern(self):
         from slime.utils.arguments import parse_megatron_role_args
 

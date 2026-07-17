@@ -460,6 +460,27 @@ def test_sao_dis_accepts_single_rollout_ppo_contract(monkeypatch):
 
 
 @pytest.mark.unit
+def test_sao_dis_accepts_custom_skip_observation_advantage(monkeypatch):
+    module = load_slime_arguments_module(monkeypatch)
+    args = make_slime_validate_args(
+        policy_loss_type="sao_dis",
+        advantage_estimator="ppo",
+        use_rollout_logprobs=True,
+        n_samples_per_prompt=1,
+        critic_train_epochs=2,
+        custom_advantage_function_path="polar.process_reward.compute_advantages",
+    )
+
+    module.slime_validate_args(args)
+
+    assert args.use_critic is True
+    assert (
+        args.custom_advantage_function_path
+        == "polar.process_reward.compute_advantages"
+    )
+
+
+@pytest.mark.unit
 def test_vanilla_ppo_rejects_sao_only_multi_epoch_critic(monkeypatch):
     module = load_slime_arguments_module(monkeypatch)
     args = make_slime_validate_args(

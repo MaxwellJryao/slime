@@ -291,6 +291,10 @@ def log_rollout_data(
                 "rollout_top_p_token_ids",
                 "rollout_top_p_token_offsets",
                 "rollout_routed_experts",
+                # Arbitrary per-sample dictionaries are optimizer inputs for
+                # custom losses/advantage functions, not numeric telemetry.
+                # They must not reach the generic ``sum(list)`` logger.
+                "metadata",
                 "global_batch_sizes",
                 "num_microbatches",
                 "micro_batch_indices",
