@@ -1,6 +1,7 @@
 import logging
 import math
 import os
+import re
 from copy import deepcopy
 
 import wandb
@@ -9,6 +10,36 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_WANDB_FINISH_TIMEOUT_SECONDS = 30.0
 _defined_metric_axes: set[tuple[str, str]] = set()
+
+# Deliberately map only reviewed, non-secret environment variables to stable
+# W&B config keys.  Do not broaden this to an environment dump: distributed
+# training environments routinely contain credentials and provider tokens.
+_SPILOT_WANDB_CONFIG_ENV_ALLOWLIST = {
+    "SPILOT_SWEEP_ARM": "spilot_sweep_arm",
+    "SPILOT_PROCESS_REWARD_PAIR_ID": "spilot_process_reward_pair_id",
+    "SPILOT_PROCESS_REWARD_PAIR_ROLE": "spilot_process_reward_pair_role",
+    "SPILOT_MATCHED_INVARIANTS_SHA256": "spilot_matched_invariants_sha256",
+    "SPILOT_PROCESS_REWARD_MODE": "spilot_process_reward_mode",
+}
+_SPILOT_SAFE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,119}")
+_SPILOT_SHA256_RE = re.compile(r"[0-9a-f]{64}")
+_SPILOT_PROCESS_REWARD_ROLES = frozenset({"control", "treatment"})
+_SPILOT_PROCESS_REWARD_MODES = frozenset({"terminal_broadcast", "cost_to_go"})
+_SPILOT_PAIRED_ARM_EXPECTATIONS = {
+    "control": ("prctrl", "terminal_broadcast"),
+    "treatment": ("prctg", "cost_to_go"),
+}
+_WANDB_CONFIG_SECRET_ARG_NAMES = frozenset(
+    {
+        "router_api_key",
+        "router_control_plane_api_keys",
+        "router_oracle_password",
+        "sglang_admin_api_key",
+        "sglang_api_key",
+        "sglang_ssl_keyfile_password",
+        "wandb_key",
+    }
+)
 
 
 def _wandb_run_name(args, *, group: str, generated_name: str) -> str:
@@ -165,6 +196,7 @@ def _compute_config_for_logging(args):
         # We may insert more default values here, and may also allow users to configure a whitelist
     ]
     output["env_vars"] = {k: v for k, v in os.environ.items() if k in whitelist_env_vars}
+    output.update(_spilot_wandb_config_from_env())
 
     if getattr(args, "use_critic", False):
         critic_args = _get_role_args_for_logging(args, role="critic")
@@ -174,7 +206,10 @@ def _compute_config_for_logging(args):
 
 
 def _args_to_config_dict(args):
-    return deepcopy(args.__dict__)
+    config = deepcopy(args.__dict__)
+    for name in _WANDB_CONFIG_SECRET_ARG_NAMES:
+        config.pop(name, None)
+    return config
 
 
 def _prefix_config_keys(config, prefix):
@@ -190,10 +225,72 @@ def _get_role_args_for_logging(args, role):
     return parse_megatron_role_args(args, args.megatron_config_path, role=role)
 
 
+def _spilot_wandb_config_from_env() -> dict[str, str]:
+    """Return validated, explicitly allowlisted SPilot experiment metadata."""
+
+    values: dict[str, str] = {}
+    for env_name, config_name in _SPILOT_WANDB_CONFIG_ENV_ALLOWLIST.items():
+        raw = os.environ.get(env_name)
+        if raw is None or not raw.strip():
+            continue
+        if raw != raw.strip():
+            raise ValueError(f"{env_name} must not contain surrounding whitespace")
+        values[config_name] = raw
+
+    for key in ("spilot_sweep_arm", "spilot_process_reward_pair_id"):
+        value = values.get(key)
+        if value is not None and _SPILOT_SAFE_ID_RE.fullmatch(value) is None:
+            raise ValueError(f"invalid {key}: expected a safe experiment identifier")
+
+    role = values.get("spilot_process_reward_pair_role")
+    if role is not None and role not in _SPILOT_PROCESS_REWARD_ROLES:
+        raise ValueError(
+            "spilot_process_reward_pair_role must be 'control' or 'treatment'"
+        )
+
+    matched_hash = values.get("spilot_matched_invariants_sha256")
+    if matched_hash is not None and _SPILOT_SHA256_RE.fullmatch(matched_hash) is None:
+        raise ValueError(
+            "spilot_matched_invariants_sha256 must be 64 lowercase hexadecimal characters"
+        )
+
+    mode = values.get("spilot_process_reward_mode")
+    if mode is not None and mode not in _SPILOT_PROCESS_REWARD_MODES:
+        raise ValueError(
+            "spilot_process_reward_mode must be 'terminal_broadcast' or 'cost_to_go'"
+        )
+
+    pair_keys = {
+        "spilot_process_reward_pair_id",
+        "spilot_process_reward_pair_role",
+        "spilot_matched_invariants_sha256",
+    }
+    present_pair_keys = pair_keys.intersection(values)
+    if present_pair_keys and present_pair_keys != pair_keys:
+        missing = ", ".join(sorted(pair_keys - present_pair_keys))
+        raise ValueError(f"incomplete SPilot process-reward pair metadata; missing: {missing}")
+    if present_pair_keys:
+        if "spilot_sweep_arm" not in values or "spilot_process_reward_mode" not in values:
+            raise ValueError(
+                "paired SPilot process-reward metadata requires sweep arm and reward mode"
+            )
+        expected_arm, expected_mode = _SPILOT_PAIRED_ARM_EXPECTATIONS[role]
+        if (
+            values["spilot_sweep_arm"] != expected_arm
+            or values["spilot_process_reward_mode"] != expected_mode
+        ):
+            raise ValueError(
+                "SPilot process-reward pair role, sweep arm, and reward mode disagree"
+            )
+
+    return values
+
+
 def _compute_secondary_config_for_logging(args, role=None):
     config = _args_to_config_dict(args)
     if role == "critic":
-        return _prefix_config_keys(config, "critic")
+        config = _prefix_config_keys(config, "critic")
+    config.update(_spilot_wandb_config_from_env())
     return config
 
 

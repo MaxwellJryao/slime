@@ -6,6 +6,8 @@ from slime.utils.metric_utils import set_wandb_step
 from slime.utils import logging_utils, wandb_utils
 from slime.utils.wandb_utils import (
     _DEFAULT_WANDB_FINISH_TIMEOUT_SECONDS,
+    _compute_config_for_logging,
+    _compute_secondary_config_for_logging,
     _init_wandb_common,
     _shared_writer_label,
     _wandb_run_name,
@@ -16,6 +18,30 @@ from slime.utils.wandb_utils import (
 
 NUM_GPUS = 0
 
+_SPILOT_PAIR_ENV = {
+    "SPILOT_SWEEP_ARM": "prctrl",
+    "SPILOT_PROCESS_REWARD_PAIR_ID": "pair-20260717-r1",
+    "SPILOT_PROCESS_REWARD_PAIR_ROLE": "control",
+    "SPILOT_MATCHED_INVARIANTS_SHA256": "a" * 64,
+    "SPILOT_PROCESS_REWARD_MODE": "terminal_broadcast",
+}
+_SPILOT_PAIR_CONFIG = {
+    "spilot_sweep_arm": "prctrl",
+    "spilot_process_reward_pair_id": "pair-20260717-r1",
+    "spilot_process_reward_pair_role": "control",
+    "spilot_matched_invariants_sha256": "a" * 64,
+    "spilot_process_reward_mode": "terminal_broadcast",
+}
+_CREDENTIAL_ARG_NAMES = (
+    "router_api_key",
+    "router_control_plane_api_keys",
+    "router_oracle_password",
+    "sglang_admin_api_key",
+    "sglang_api_key",
+    "sglang_ssl_keyfile_password",
+    "wandb_key",
+)
+
 
 def _args(*, always_use_train_step: bool) -> Namespace:
     return Namespace(
@@ -24,6 +50,110 @@ def _args(*, always_use_train_step: bool) -> Namespace:
         n_samples_per_prompt=8,
         global_batch_size=20,
     )
+
+
+@pytest.mark.unit
+def test_primary_wandb_config_includes_only_validated_spilot_metadata(monkeypatch):
+    for name, value in _SPILOT_PAIR_ENV.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("WANDB_API_KEY", "must-not-be-logged")
+    monkeypatch.setenv("SPILOT_PROVIDER_API_KEY", "must-not-be-logged")
+
+    config = _compute_config_for_logging(
+        Namespace(use_critic=False, rank=0, wandb_key="argument-secret")
+    )
+
+    assert {key: config[key] for key in _SPILOT_PAIR_CONFIG} == _SPILOT_PAIR_CONFIG
+    serialized = repr(config)
+    assert "must-not-be-logged" not in serialized
+    assert "WANDB_API_KEY" not in serialized
+    assert "SPILOT_PROVIDER_API_KEY" not in serialized
+    assert "argument-secret" not in serialized
+    assert "wandb_key" not in config
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("role", [None, "actor", "critic"])
+def test_secondary_wandb_config_includes_same_spilot_metadata(monkeypatch, role):
+    for name, value in _SPILOT_PAIR_ENV.items():
+        monkeypatch.setenv(name, value)
+
+    config = _compute_secondary_config_for_logging(
+        Namespace(rank=2, wandb_key="argument-secret"), role=role
+    )
+
+    assert {key: config[key] for key in _SPILOT_PAIR_CONFIG} == _SPILOT_PAIR_CONFIG
+    if role == "critic":
+        assert config["critic/rank"] == 2
+        assert "rank" not in config
+    else:
+        assert config["rank"] == 2
+    assert "argument-secret" not in repr(config)
+    assert "wandb_key" not in config
+    assert "critic/wandb_key" not in config
+
+
+@pytest.mark.unit
+def test_empty_spilot_metadata_is_omitted(monkeypatch):
+    for name in _SPILOT_PAIR_ENV:
+        monkeypatch.setenv(name, "  ")
+
+    config = _compute_secondary_config_for_logging(Namespace(rank=1))
+
+    assert not set(_SPILOT_PAIR_CONFIG).intersection(config)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("updates", "message"),
+    [
+        ({"SPILOT_SWEEP_ARM": "bad arm"}, "safe experiment identifier"),
+        ({"SPILOT_PROCESS_REWARD_PAIR_ROLE": "baseline"}, "control.*treatment"),
+        ({"SPILOT_MATCHED_INVARIANTS_SHA256": "ABC"}, "64 lowercase"),
+        ({"SPILOT_PROCESS_REWARD_MODE": "learned_prm"}, "terminal_broadcast.*cost_to_go"),
+        ({"SPILOT_PROCESS_REWARD_PAIR_ID": ""}, "incomplete"),
+    ],
+)
+def test_invalid_or_incomplete_spilot_metadata_fails_closed(
+    monkeypatch, updates, message
+):
+    env = dict(_SPILOT_PAIR_ENV)
+    env.update(updates)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+
+    with pytest.raises(ValueError, match=message):
+        _compute_config_for_logging(Namespace(use_critic=False))
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("credential_name", _CREDENTIAL_ARG_NAMES)
+def test_credential_arguments_are_excluded_from_all_wandb_writer_configs(
+    monkeypatch, credential_name
+):
+    for name, value in _SPILOT_PAIR_ENV.items():
+        monkeypatch.setenv(name, value)
+    args = Namespace(
+        use_critic=False,
+        input_key="prompt",
+        reward_key="reward",
+        max_tokens_per_gpu=8192,
+        **{credential_name: "credential-must-not-be-logged"},
+    )
+
+    configs = (
+        _compute_config_for_logging(args),
+        _compute_secondary_config_for_logging(args, role="actor"),
+        _compute_secondary_config_for_logging(args, role="critic"),
+    )
+
+    for config in configs:
+        assert "credential-must-not-be-logged" not in repr(config)
+        assert credential_name not in config
+        assert f"critic/{credential_name}" not in config
+    assert configs[0]["input_key"] == "prompt"
+    assert configs[0]["reward_key"] == "reward"
+    assert configs[0]["max_tokens_per_gpu"] == 8192
 
 
 @pytest.mark.unit
