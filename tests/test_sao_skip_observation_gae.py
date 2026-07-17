@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from slime.utils.ppo_utils import (
+    get_segmented_skip_observation_advantages_and_returns_batch,
     get_skip_observation_advantages_and_returns,
     get_skip_observation_advantages_and_returns_batch,
 )
@@ -113,3 +114,91 @@ def test_skip_observation_gae_rejects_trajectory_without_actions() -> None:
             gamma=1.0,
             policy_lambd=0.5,
         )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("gamma", "alpha", "critic_lambd"),
+    [(1.0, 1.5, 1.0), (0.83, 0.75, 0.4)],
+)
+def test_segmented_targets_are_representation_invariant(
+    monkeypatch,
+    gamma: float,
+    alpha: float,
+    critic_lambd: float,
+) -> None:
+    """Merged CTG targets must match two semantically identical traces."""
+
+    from megatron.core import mpu
+
+    monkeypatch.setattr(mpu, "get_context_parallel_world_size", lambda: 1)
+    merged_values = torch.tensor([0.1, -0.2, 0.3, 99.0, -99.0, 0.4, 0.2, -0.1])
+    merged_token_rewards = torch.tensor(
+        [-0.01, -0.02, -0.03, 100.0, -100.0, -0.04, -0.05, -0.06]
+    )
+    merged_mask = torch.tensor([True, True, True, False, False, True, True, True])
+
+    merged_advantages, merged_returns = (
+        get_segmented_skip_observation_advantages_and_returns_batch(
+            total_lengths=[10],
+            response_lengths=[8],
+            values_list=[merged_values],
+            token_rewards_list=[merged_token_rewards],
+            segment_ranges_list=[[(0, 3), (5, 8)]],
+            segment_terminal_targets_list=[[0.9, 1.0]],
+            action_masks=[merged_mask],
+            gamma=gamma,
+            length_adaptive_alpha=alpha,
+            critic_lambd=critic_lambd,
+        )
+    )
+    legacy_advantages, legacy_returns = (
+        get_skip_observation_advantages_and_returns_batch(
+            total_lengths=[5, 9],
+            response_lengths=[3, 3],
+            values_list=[merged_values[:3], merged_values[5:]],
+            token_rewards_list=[merged_token_rewards[:3], merged_token_rewards[5:]],
+            sequence_rewards=[0.9, 1.0],
+            action_masks=[torch.ones(3, dtype=torch.bool)] * 2,
+            gamma=gamma,
+            length_adaptive_alpha=alpha,
+            critic_lambd=critic_lambd,
+        )
+    )
+
+    torch.testing.assert_close(merged_advantages[0][:3], legacy_advantages[0])
+    torch.testing.assert_close(merged_advantages[0][5:], legacy_advantages[1])
+    torch.testing.assert_close(merged_returns[0][:3], legacy_returns[0])
+    torch.testing.assert_close(merged_returns[0][5:], legacy_returns[1])
+    torch.testing.assert_close(merged_advantages[0][3:5], torch.zeros(2))
+    torch.testing.assert_close(merged_returns[0][3:5], torch.zeros(2))
+
+
+@pytest.mark.unit
+def test_segmented_terminal_targets_do_not_accumulate_across_actions(
+    monkeypatch,
+) -> None:
+    from megatron.core import mpu
+
+    monkeypatch.setattr(mpu, "get_context_parallel_world_size", lambda: 1)
+    advantages, returns = (
+        get_segmented_skip_observation_advantages_and_returns_batch(
+            total_lengths=[10],
+            response_lengths=[8],
+            values_list=[torch.zeros(8)],
+            token_rewards_list=[torch.zeros(8)],
+            segment_ranges_list=[[(0, 3), (5, 8)]],
+            segment_terminal_targets_list=[[0.9, 1.0]],
+            action_masks=[
+                torch.tensor([True, True, True, False, False, True, True, True])
+            ],
+            gamma=1.0,
+            length_adaptive_alpha=1.5,
+            critic_lambd=1.0,
+        )
+    )
+
+    assert returns[0][2].item() == pytest.approx(0.9)
+    assert returns[0][7].item() == pytest.approx(1.0)
+    assert returns[0][0].item() == pytest.approx(0.9)
+    assert advantages[0][3:5].tolist() == [0.0, 0.0]

@@ -611,6 +611,180 @@ def get_skip_observation_advantages_and_returns_batch(
     return advantages_list, returns_list
 
 
+@torch.no_grad()
+def get_segmented_skip_observation_advantages_and_returns_batch(
+    total_lengths: list[int],
+    response_lengths: list[int],
+    values_list: list[torch.Tensor],
+    token_rewards_list: list[torch.Tensor],
+    segment_ranges_list: list[list[tuple[int, int]]],
+    segment_terminal_targets_list: list[list[float]],
+    action_masks: list[torch.Tensor],
+    gamma: float,
+    length_adaptive_alpha: float,
+    critic_lambd: float = 1.0,
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    """Compute skip-observation GAE independently inside action segments.
+
+    ``segment_terminal_targets_list`` contains already-computed returns (for
+    example per-action cost-to-go targets), not immediate rewards. Each target
+    is therefore applied only as the terminal objective of its corresponding
+    half-open response range and the GAE recursion is reset at every segment
+    boundary. This makes a merged response exactly equivalent to representing
+    the same action completions as independent traces.
+
+    ``token_rewards_list`` remains the stream of immediate per-token rewards,
+    such as a KL penalty. Every trainable action token must belong to exactly
+    one non-overlapping segment; observation-only gaps are allowed.
+    """
+
+    from megatron.core import mpu
+
+    batch_size = len(response_lengths)
+    fields = (
+        total_lengths,
+        values_list,
+        token_rewards_list,
+        segment_ranges_list,
+        segment_terminal_targets_list,
+        action_masks,
+    )
+    if any(len(field) != batch_size for field in fields):
+        raise ValueError("all segmented GAE batch fields must have the same length")
+    if batch_size == 0:
+        return [], []
+    if not length_adaptive_alpha > 0.0:
+        raise ValueError("length_adaptive_alpha must be greater than zero")
+
+    cp_size = mpu.get_context_parallel_world_size()
+    advantages_list: list[torch.Tensor] = []
+    returns_list: list[torch.Tensor] = []
+
+    for (
+        total_len,
+        response_len,
+        values,
+        token_rewards,
+        segment_ranges,
+        segment_terminal_targets,
+        action_mask,
+    ) in zip(
+        total_lengths,
+        response_lengths,
+        values_list,
+        token_rewards_list,
+        segment_ranges_list,
+        segment_terminal_targets_list,
+        action_masks,
+        strict=True,
+    ):
+        if response_len <= 0:
+            raise ValueError(f"response length must be positive, got {response_len}")
+        if action_mask.numel() != response_len:
+            raise ValueError(
+                f"action mask length {action_mask.numel()} does not match "
+                f"response length {response_len}"
+            )
+        if not segment_ranges or len(segment_ranges) != len(segment_terminal_targets):
+            raise ValueError("segmented GAE requires one target per non-empty segment")
+
+        if cp_size > 1:
+            from slime.backends.megatron_utils.cp_utils import all_gather_with_cp
+
+            full_values = all_gather_with_cp(values, total_len, response_len)
+            full_token_rewards = all_gather_with_cp(
+                token_rewards, total_len, response_len
+            )
+        else:
+            full_values = values
+            full_token_rewards = token_rewards
+
+        full_values = full_values[:response_len]
+        full_token_rewards = full_token_rewards[:response_len]
+        if (
+            full_values.numel() != response_len
+            or full_token_rewards.numel() != response_len
+        ):
+            raise ValueError("segmented GAE values/rewards do not cover the response")
+        full_action_mask = action_mask.to(device=full_values.device, dtype=torch.bool)
+        full_advantages = torch.zeros_like(full_values)
+        full_returns = torch.zeros_like(full_values)
+        covered_action_mask = torch.zeros_like(full_action_mask)
+        previous_end = 0
+
+        for segment_range, terminal_target in zip(
+            segment_ranges, segment_terminal_targets, strict=True
+        ):
+            if (
+                not isinstance(segment_range, tuple)
+                or len(segment_range) != 2
+                or isinstance(segment_range[0], bool)
+                or isinstance(segment_range[1], bool)
+                or not isinstance(segment_range[0], int)
+                or not isinstance(segment_range[1], int)
+            ):
+                raise ValueError("segment ranges must be integer (start, end) tuples")
+            start, end = segment_range
+            if not 0 <= start < end <= response_len or start < previous_end:
+                raise ValueError("segment ranges must be ordered, non-overlapping, and in bounds")
+
+            segment_mask = full_action_mask[start:end]
+            segment_action_indices = torch.nonzero(
+                segment_mask, as_tuple=False
+            ).flatten()
+            if segment_action_indices.numel() == 0:
+                raise ValueError("each segmented GAE range must contain an action token")
+            target = torch.as_tensor(
+                terminal_target,
+                dtype=full_token_rewards.dtype,
+                device=full_token_rewards.device,
+            )
+            if target.numel() != 1 or not bool(torch.isfinite(target).all()):
+                raise ValueError("segment terminal targets must be finite scalars")
+
+            segment_rewards = full_token_rewards[start:end].clone()
+            segment_rewards[segment_action_indices[-1]] += target.reshape(())
+            segment_raw_length = end - start
+            policy_lambd = 1.0 - 1.0 / (
+                length_adaptive_alpha * segment_raw_length
+            )
+            if not 0.0 <= policy_lambd <= 1.0:
+                raise ValueError(
+                    "length-adaptive policy lambda fell outside [0, 1]: "
+                    f"alpha={length_adaptive_alpha}, "
+                    f"segment_len={segment_raw_length}, lambda={policy_lambd}"
+                )
+            segment_advantages, segment_returns = (
+                get_skip_observation_advantages_and_returns(
+                    full_values[start:end],
+                    segment_rewards,
+                    segment_mask,
+                    gamma,
+                    policy_lambd,
+                    critic_lambd,
+                )
+            )
+            full_advantages[start:end] = segment_advantages
+            full_returns[start:end] = segment_returns
+            covered_action_mask[start:end] |= segment_mask
+            previous_end = end
+
+        if not torch.equal(covered_action_mask, full_action_mask):
+            raise ValueError("segmented GAE ranges must cover every action token exactly once")
+
+        if cp_size > 1:
+            from slime.backends.megatron_utils.cp_utils import slice_log_prob_with_cp
+
+            full_advantages = slice_log_prob_with_cp(
+                full_advantages, total_len, response_len
+            )
+            full_returns = slice_log_prob_with_cp(full_returns, total_len, response_len)
+        advantages_list.append(full_advantages)
+        returns_list.append(full_returns)
+
+    return advantages_list, returns_list
+
+
 def get_advantages_and_returns(
     total_len: int,
     response_len: int,
