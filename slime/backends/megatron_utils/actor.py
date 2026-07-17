@@ -22,6 +22,7 @@ from slime.utils.memory_utils import clear_memory, print_memory
 from slime.utils.misc import Box
 from slime.utils.reloadable_process_group import destroy_process_groups, monkey_patch_torch_dist, reload_process_groups
 from slime.utils.routing_replay import RoutingReplay
+from slime.utils.session_native_gae_runtime import CRITIC_DENOM_FIELD, CRITIC_MASK_FIELD
 from slime.utils.timer import Timer, inverse_timer, timer, with_defer
 from slime.utils.types import RolloutBatch
 
@@ -250,10 +251,20 @@ class MegatronTrainRayActor(TrainRayActor):
         device = torch.cuda.current_device()
         rollout_data["tokens"] = [t.to(device=device, dtype=torch.long, non_blocking=True) for t in rollout_data["tokens"]]
         rollout_data["loss_masks"] = [t.to(device=device, dtype=torch.int, non_blocking=True) for t in rollout_data["loss_masks"]]
+        if CRITIC_MASK_FIELD in rollout_data:
+            rollout_data[CRITIC_MASK_FIELD] = [
+                t.to(device=device, dtype=torch.int, non_blocking=True) for t in rollout_data[CRITIC_MASK_FIELD]
+            ]
         if "rollout_mask_sums" in rollout_data:
             # Promote precomputed per-rollout mask totals to GPU tensors here
             # (matching loss_masks) so the loss reducer can just divide.
             rollout_data["rollout_mask_sums"] = rollout_data["rollout_mask_sums"].to(device=device, dtype=torch.float32, non_blocking=True)
+        if CRITIC_DENOM_FIELD in rollout_data:
+            rollout_data[CRITIC_DENOM_FIELD] = rollout_data[CRITIC_DENOM_FIELD].to(
+                device=device,
+                dtype=torch.float32,
+                non_blocking=True,
+            )
         if "multimodal_train_inputs" in rollout_data:
             # Move multimodal training tensors to GPU in advance
             rollout_data["multimodal_train_inputs"] = [({key: value.to(device=device, non_blocking=True) if isinstance(value, torch.Tensor) else value for key, value in mm_dict.items()} if mm_dict is not None else None) for mm_dict in rollout_data["multimodal_train_inputs"]]

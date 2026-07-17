@@ -12,6 +12,15 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from slime.utils import train_metric_utils
 from slime.utils.flops_utils import calculate_fwd_flops
 from slime.utils.metric_utils import compute_pass_rate, set_wandb_step
+from slime.utils.session_native_gae_runtime import (
+    CRITIC_DENOM_FIELD,
+    CRITIC_MASK_FIELD,
+    METRICS_FIELD,
+    NORMALIZED_FLAG,
+    RUNTIME_CAPABILITIES_FIELD,
+    RUNTIME_VERSION_FIELD,
+    validate_metrics as validate_session_native_gae_metrics,
+)
 from slime.utils.types import RolloutBatch
 
 from ...utils import logging_utils
@@ -202,6 +211,46 @@ def gather_log_data(
     return reduced_log_dict
 
 
+def log_session_native_gae_metrics(
+    rollout_id: int,
+    args: Namespace,
+    rollout_data: RolloutBatch,
+) -> None:
+    """Publish the seven action-level metrics on their canonical W&B axes."""
+
+    if METRICS_FIELD not in rollout_data:
+        return
+    metrics = validate_session_native_gae_metrics(rollout_data[METRICS_FIELD])
+    if mpu.get_tensor_model_parallel_rank() != 0 or not mpu.is_pipeline_last_stage():
+        return
+
+    reduced = gather_and_reduce_log_dict(
+        metrics,
+        dp_size=mpu.get_data_parallel_world_size(with_context_parallel=True),
+        dp_src_rank=mpu.get_data_parallel_src_rank(with_context_parallel=True),
+        dp_group=mpu.get_data_parallel_group_gloo(with_context_parallel=True),
+    )
+    if reduced is None:
+        return
+
+    rollout_metrics = {key: value for key, value in reduced.items() if key.startswith("rollout/")}
+    rollout_step_key = set_wandb_step(
+        args,
+        rollout_metrics,
+        rollout_id,
+        default_step_key="rollout/step",
+        completed_train_batch=True,
+    )
+    logging_utils.log(args, rollout_metrics, step_key=rollout_step_key)
+
+    train_metrics = {key: value for key, value in reduced.items() if key.startswith("train/")}
+    num_steps = len(rollout_data["num_microbatches"])
+    if num_steps <= 0:
+        raise ValueError("session-native GAE metrics require at least one optimizer step")
+    train_metrics["train/step"] = rollout_id * num_steps + num_steps - 1
+    logging_utils.log(args, train_metrics, step_key="train/step")
+
+
 class DataIterator:
     """Iterator over a rollout dict following an explicit micro-batch index schedule."""
 
@@ -263,6 +312,8 @@ def log_rollout_data(
     - Non-tensor lists are averaged elementwise.
     - Scalars are converted to Python numbers.
     """
+    log_session_native_gae_metrics(rollout_id, args, rollout_data)
+
     if mpu.get_tensor_model_parallel_rank() == 0 and mpu.is_pipeline_last_stage():
         cp_size = mpu.get_context_parallel_world_size()
         log_dict = {}
@@ -285,6 +336,9 @@ def log_rollout_data(
                 "tokens",
                 "multimodal_train_inputs",
                 "loss_masks",
+                CRITIC_MASK_FIELD,
+                CRITIC_DENOM_FIELD,
+                "metadata",
                 "sample_indices",
                 "rollout_ids",
                 "rollout_mask_sums",
@@ -294,6 +348,10 @@ def log_rollout_data(
                 "global_batch_sizes",
                 "num_microbatches",
                 "micro_batch_indices",
+                RUNTIME_VERSION_FIELD,
+                RUNTIME_CAPABILITIES_FIELD,
+                NORMALIZED_FLAG,
+                METRICS_FIELD,
             ]:
                 continue
             # Emit (sum, count) so gather_log_data can do a weighted average across

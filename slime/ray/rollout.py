@@ -27,6 +27,13 @@ from slime.utils.http_utils import _wrap_ipv6, find_available_port, get_host_inf
 from slime.utils.logging_utils import configure_logger, init_tracking
 from slime.utils.metric_utils import compute_pass_rate, compute_statistics, dict_add_prefix, set_wandb_step
 from slime.utils.misc import Box, group_by, load_function
+from slime.utils.session_native_gae_runtime import (
+    CRITIC_DENOM_FIELD,
+    CRITIC_MASK_FIELD,
+    copy_runtime_attestation,
+    enabled as session_native_gae_enabled,
+    prepare_train_data as prepare_session_native_gae_train_data,
+)
 from slime.utils.types import Sample
 
 from ..utils.metric_utils import has_repetition
@@ -249,6 +256,7 @@ def _validate_allocated_rollout_port_range(port: int, consecutive: int, ephemera
 _ROLLOUT_DATA_TENSOR_DTYPES = {
     "tokens": torch.long,
     "loss_masks": torch.int,
+    CRITIC_MASK_FIELD: torch.int,
     "rollout_log_probs": torch.float32,
     "rollout_top_p_token_ids": torch.int32,
     "rollout_top_p_token_offsets": torch.int32,
@@ -298,6 +306,11 @@ def _tensorize_rollout_data_for_training(rollout_data: dict[str, Any]) -> None:
     if "rollout_mask_sums" in rollout_data:
         rollout_data["rollout_mask_sums"] = _cpu_tensor(
             rollout_data["rollout_mask_sums"],
+            dtype=torch.float32,
+        )
+    if CRITIC_DENOM_FIELD in rollout_data:
+        rollout_data[CRITIC_DENOM_FIELD] = _cpu_tensor(
+            rollout_data[CRITIC_DENOM_FIELD],
             dtype=torch.float32,
         )
 
@@ -1303,7 +1316,9 @@ class RolloutManager:
         Convert inference generated samples to training data.
         """
         if self.custom_convert_samples_to_train_data_func is not None:
-            return self.custom_convert_samples_to_train_data_func(self.args, samples)
+            train_data = self.custom_convert_samples_to_train_data_func(self.args, samples)
+            prepare_session_native_gae_train_data(self.args, samples, train_data)
+            return train_data
 
         raw_rewards, rewards = self._post_process_rewards(samples)
 
@@ -1389,7 +1404,7 @@ class RolloutManager:
         if samples[0].rollout_routed_experts is not None:
             train_data["rollout_routed_experts"] = [sample.rollout_routed_experts for sample in samples]
 
-        if samples[0].train_metadata is not None:
+        if any(sample.train_metadata is not None for sample in samples):
             train_data["metadata"] = [sample.train_metadata for sample in samples]
 
         if any(sample.multimodal_train_inputs is not None for sample in samples):
@@ -1398,6 +1413,7 @@ class RolloutManager:
         if samples[0].teacher_log_probs is not None:
             train_data["teacher_log_probs"] = [sample.teacher_log_probs for sample in samples]
 
+        prepare_session_native_gae_train_data(self.args, samples, train_data)
         return train_data
 
     def set_train_parallel_config(self, config: dict):
@@ -1440,7 +1456,10 @@ class RolloutManager:
                 "rewards",
                 "truncated",
                 "loss_masks",
+                CRITIC_MASK_FIELD,
+                CRITIC_DENOM_FIELD,
                 "round_number",
+                "metadata",
                 "sample_indices",
                 "rollout_ids",
                 "rollout_mask_sums",
@@ -1462,6 +1481,8 @@ class RolloutManager:
             rollout_data["global_batch_sizes"] = global_batch_sizes
             rollout_data["num_microbatches"] = num_microbatches
             rollout_data["micro_batch_indices"] = micro_batch_indices[r]
+            if session_native_gae_enabled(self.args):
+                copy_runtime_attestation(data, rollout_data)
             _tensorize_rollout_data_for_training(rollout_data)
             transport = getattr(self.args, "rollout_data_transport", "object-store")
             if transport == "nixl":

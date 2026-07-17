@@ -31,6 +31,7 @@ except ImportError:
     from megatron.core.utils import unwrap_model
 from slime.utils import logging_utils
 from slime.utils.memory_utils import clear_memory
+from slime.utils.session_native_gae_runtime import CRITIC_DENOM_FIELD, CRITIC_MASK_FIELD
 from slime.utils.startup_timing import (
     elapsed_seconds_from_env,
     record_train_phase_duration,
@@ -624,6 +625,8 @@ def train_one_step(
                     "rollout_log_probs",
                     "teacher_log_probs",
                     "rollout_mask_sums",
+                    CRITIC_MASK_FIELD,
+                    CRITIC_DENOM_FIELD,
                 ],
             ),
             args.data_pad_size_multiplier,

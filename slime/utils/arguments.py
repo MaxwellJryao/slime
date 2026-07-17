@@ -1109,6 +1109,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--session-native-gae",
+                action="store_true",
+                default=False,
+                help=(
+                    "Enable the fail-closed session-native action-GAE transport and optimizer contract. "
+                    "Requires a compatible custom rollout adapter and custom advantage function."
+                ),
+            )
+            parser.add_argument(
                 "--use-kl-loss", action="store_true", default=False, help="whether to use KL loss from GRPO"
             )
             parser.add_argument(
@@ -1784,7 +1793,8 @@ def _apply_megatron_role_overrides(base_args, overrides, role):
         # Critic-specific: disable features that only apply to actors.
         role_args.kl_coef = 0
         role_args.use_opd = False
-        role_args.custom_advantage_function_path = None
+        if not getattr(role_args, "session_native_gae", False):
+            role_args.custom_advantage_function_path = None
         role_args.untie_embeddings_and_output_weights = True
         if "disable_param_buffers_cpu_backup" not in overrides:
             role_args.disable_param_buffers_cpu_backup = False
@@ -1941,6 +1951,10 @@ def _validate_update_weight_args(args) -> None:
 
 def slime_validate_args(args):
     args.eval_datasets = _resolve_eval_datasets(args)
+
+    from slime.utils.session_native_gae_runtime import validate_args as validate_session_native_gae_args
+
+    validate_session_native_gae_args(args)
 
     if getattr(args, "eval_resumed_checkpoint_before_train", False):
         if args.eval_interval is None:

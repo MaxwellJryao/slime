@@ -25,6 +25,12 @@ from slime.utils.ppo_utils import (
     get_reinforce_plus_plus_returns,
     get_skip_observation_advantages_and_returns_batch,
 )
+from slime.utils.session_native_gae_runtime import (
+    CRITIC_DENOM_FIELD,
+    CRITIC_MASK_FIELD,
+    enabled as session_native_gae_enabled,
+    validate_optimizer_payload as validate_session_native_gae_optimizer_payload,
+)
 from slime.utils.types import RolloutBatch
 
 from .cp_utils import (
@@ -716,6 +722,7 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
     if args.custom_advantage_function_path is not None:
         custom_adv_fn = load_function(args.custom_advantage_function_path)
         custom_adv_fn(args, rollout_data)
+        validate_session_native_gae_optimizer_payload(args, rollout_data)
         advantages, returns = rollout_data["advantages"], rollout_data["returns"]
 
     elif args.advantage_estimator in ["grpo", "gspo", "cispo"]:
@@ -788,7 +795,10 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
         )
 
     # TODO: OpenRLHF always does advantages normalization but veRL doesn't seem to do it.
-    if args.normalize_advantages:
+    # The session-native custom function whitens one scalar per Router action
+    # before broadcasting it over response tokens. Running generic token
+    # whitening here would reintroduce response-length weighting.
+    if args.normalize_advantages and not session_native_gae_enabled(args):
         all_advs = torch.cat(advantages)
         cp_size = mpu.get_context_parallel_world_size()
         if cp_size == 1:
@@ -1317,13 +1327,21 @@ def loss_function(
         - `logging_dict` has keys "keys" (list of str metric names) and
           "values" (1D tensor: [count, metric1, metric2, ...]).
     """
-    num_tokens = sum([torch.clamp_min(loss_mask.sum(), 1) for loss_mask in batch["loss_masks"]])
+    reduction_masks = batch["loss_masks"]
+    reduction_denoms = batch["rollout_mask_sums"]
+    if args.loss_type == "value_loss" and session_native_gae_enabled(args):
+        reduction_masks = batch.get(CRITIC_MASK_FIELD)
+        reduction_denoms = batch.get(CRITIC_DENOM_FIELD)
+        if reduction_masks is None or reduction_denoms is None:
+            raise ValueError("session-native critic loss requires separate action-boundary masks and denominators")
+
+    num_tokens = sum([torch.clamp_min(loss_mask.sum(), 1) for loss_mask in reduction_masks])
 
     sum_of_sample_mean = get_sum_of_sample_mean(
         batch["total_lengths"],
         batch["response_lengths"],
-        batch["loss_masks"],
-        batch["rollout_mask_sums"],
+        reduction_masks,
+        reduction_denoms,
         args.calculate_per_token_loss,
     )
 
