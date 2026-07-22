@@ -612,6 +612,12 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.debug_train_only or self.args.debug_rollout_only:
             return {}
 
+        # Auxiliary checkpoint loads leave ``self.model`` in ref/teacher state.
+        # Rollout engines must always receive the trainable actor, especially on
+        # the initial sync after resuming a checkpoint.
+        if self._active_model_tag != "actor":
+            self._switch_model("actor")
+
         if self.args.use_fault_tolerance:
             if dist.get_rank() == 0:
                 ray.get(self.rollout_manager.recover_updatable_engines.remote())
