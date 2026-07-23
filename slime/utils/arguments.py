@@ -1450,6 +1450,17 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--gdpo-reward-keys",
+                type=str,
+                nargs=2,
+                metavar=("REWARD_1", "REWARD_2"),
+                default=None,
+                help=(
+                    "Two named reward components consumed by a GDPO-aware custom "
+                    "reward post-processor. Disabled when omitted."
+                ),
+            )
+            parser.add_argument(
                 "--eval-reward-key",
                 type=str,
                 default=None,
@@ -1890,20 +1901,30 @@ def slime_validate_args(args):
     args.eval_datasets = _resolve_eval_datasets(args)
 
     dvao_reward_keys = getattr(args, "dvao_reward_keys", None)
-    if dvao_reward_keys is not None:
-        if len(set(dvao_reward_keys)) != 2 or any(
-            not key.strip() for key in dvao_reward_keys
+    gdpo_reward_keys = getattr(args, "gdpo_reward_keys", None)
+    if dvao_reward_keys is not None and gdpo_reward_keys is not None:
+        raise ValueError(
+            "--dvao-reward-keys and --gdpo-reward-keys are mutually exclusive"
+        )
+    for option, reward_keys in (
+        ("--dvao-reward-keys", dvao_reward_keys),
+        ("--gdpo-reward-keys", gdpo_reward_keys),
+    ):
+        if reward_keys is None:
+            continue
+        if len(set(reward_keys)) != 2 or any(
+            not key.strip() for key in reward_keys
         ):
             raise ValueError(
-                "--dvao-reward-keys requires two distinct non-empty names"
+                f"{option} requires two distinct non-empty names"
             )
         if args.advantage_estimator != "grpo":
             raise ValueError(
-                "--dvao-reward-keys currently requires --advantage-estimator=grpo"
+                f"{option} currently requires --advantage-estimator=grpo"
             )
         if not args.rewards_normalization:
             raise ValueError(
-                "--dvao-reward-keys requires reward normalization"
+                f"{option} requires reward normalization"
             )
 
     if getattr(args, "eval_resumed_checkpoint_before_train", False):
