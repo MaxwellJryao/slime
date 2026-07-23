@@ -1483,6 +1483,25 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--polar-gdpo-cost-gate-all-correct",
+                action="store_true",
+                help=(
+                    "GDPO cost gate for a Polar reward post-processor: apply the "
+                    "second (cost) reward component only within prompt groups "
+                    "where every trajectory is fully correct; otherwise train on "
+                    "the first (accuracy) component alone."
+                ),
+            )
+            parser.add_argument(
+                "--polar-controller-require-routing-action",
+                action="store_true",
+                help=(
+                    "Drop (zero-advantage) any prompt group in which no trajectory "
+                    "ever took a realized escalate or deescalate action, regardless "
+                    "of reward. Inert when routing actions are not stamped."
+                ),
+            )
+            parser.add_argument(
                 "--eval-reward-key",
                 type=str,
                 default=None,
