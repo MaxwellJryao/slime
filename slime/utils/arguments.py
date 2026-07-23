@@ -1496,9 +1496,9 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "--polar-controller-require-routing-action",
                 action="store_true",
                 help=(
-                    "Drop (zero-advantage) any prompt group in which no trajectory "
-                    "ever took a realized escalate or deescalate action, regardless "
-                    "of reward. Inert when routing actions are not stamped."
+                    "Remove from training (via remove_sample) any prompt group in "
+                    "which no trajectory ever took a realized escalate or deescalate "
+                    "action. Inert when routing actions are not stamped."
                 ),
             )
             parser.add_argument(
