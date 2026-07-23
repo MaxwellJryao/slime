@@ -1493,6 +1493,32 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--polar-drop-all-wrong-groups",
+                action="store_true",
+                help=(
+                    "Polar controller group selection: drop prompt groups whose "
+                    "trajectories are all incorrect from the training batch."
+                ),
+            )
+            parser.add_argument(
+                "--polar-drop-all-keep-groups",
+                action="store_true",
+                help=(
+                    "Polar controller group selection: drop prompt groups that "
+                    "never realized an escalate or deescalate action. Inert when "
+                    "routing actions are not stamped."
+                ),
+            )
+            parser.add_argument(
+                "--polar-balance-all-correct-groups",
+                action="store_true",
+                help=(
+                    "Polar controller group selection: downsample fully-correct "
+                    "prompt groups to the number of mixed groups so the cost "
+                    "signal does not dominate accuracy."
+                ),
+            )
+            parser.add_argument(
                 "--eval-reward-key",
                 type=str,
                 default=None,
