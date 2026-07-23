@@ -1461,6 +1461,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--polar-controller-invalid-turn-penalty",
+                type=float,
+                default=0.0,
+                help=(
+                    "Weight of the centered format signal a Polar controller "
+                    "reward post-processor adds for controller turns whose "
+                    "response is not a parseable routing decision. 0 disables it."
+                ),
+            )
+            parser.add_argument(
                 "--eval-reward-key",
                 type=str,
                 default=None,
