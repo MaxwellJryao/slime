@@ -1471,6 +1471,18 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--polar-controller-credit-mode",
+                type=str,
+                choices=("standard", "actual_action_balanced"),
+                default="standard",
+                help=(
+                    "Controller credit assignment for a Polar reward "
+                    "post-processor. 'actual_action_balanced' rescales advantages "
+                    "so realized keep/escalate/deescalate routing actions are "
+                    "equal policy-loss strata; 'standard' leaves them unchanged."
+                ),
+            )
+            parser.add_argument(
                 "--eval-reward-key",
                 type=str,
                 default=None,
