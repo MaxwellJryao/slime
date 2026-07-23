@@ -271,6 +271,8 @@ def make_slime_validate_args(**overrides):
         eps_clip=0.2,
         eval_reward_key=None,
         reward_key="reward",
+        dvao_reward_keys=None,
+        rewards_normalization=True,
         dump_details=None,
         save_debug_rollout_data=None,
         save_debug_train_data=None,
@@ -315,6 +317,48 @@ def make_slime_validate_args(**overrides):
     )
     values.update(overrides)
     return types.SimpleNamespace(**values)
+
+
+@pytest.mark.unit
+def test_slime_validate_args_accepts_two_dvao_reward_keys(monkeypatch):
+    module = load_slime_arguments_module(monkeypatch)
+    args = make_slime_validate_args(
+        dvao_reward_keys=["reward_1", "reward_2"],
+        n_samples_per_prompt=2,
+    )
+
+    module.slime_validate_args(args)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "keys",
+    [
+        ["reward", "reward"],
+        ["reward", ""],
+    ],
+)
+def test_slime_validate_args_rejects_invalid_dvao_reward_keys(
+    monkeypatch,
+    keys,
+):
+    module = load_slime_arguments_module(monkeypatch)
+    args = make_slime_validate_args(dvao_reward_keys=keys)
+
+    with pytest.raises(ValueError, match="distinct non-empty"):
+        module.slime_validate_args(args)
+
+
+@pytest.mark.unit
+def test_slime_validate_args_restricts_dvao_to_grpo(monkeypatch):
+    module = load_slime_arguments_module(monkeypatch)
+    args = make_slime_validate_args(
+        dvao_reward_keys=["reward_1", "reward_2"],
+        advantage_estimator="ppo",
+    )
+
+    with pytest.raises(ValueError, match="advantage-estimator=grpo"):
+        module.slime_validate_args(args)
 
 
 @pytest.mark.unit
