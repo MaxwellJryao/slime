@@ -1509,13 +1509,22 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "routing actions are not stamped."
                 ),
             )
-            parser.add_argument(
+            all_correct_balance = parser.add_mutually_exclusive_group()
+            all_correct_balance.add_argument(
                 "--polar-balance-all-correct-groups",
                 action="store_true",
                 help=(
                     "Polar controller group selection: downsample fully-correct "
                     "prompt groups to the number of mixed groups so the cost "
                     "signal does not dominate accuracy."
+                ),
+            )
+            all_correct_balance.add_argument(
+                "--polar-reweight-all-correct-groups",
+                action="store_true",
+                help=(
+                    "Polar controller advantage weighting: EMA-balance fully-correct "
+                    "and mixed prompt groups after prior group-selection masks."
                 ),
             )
             parser.add_argument(
