@@ -2,6 +2,7 @@ import json
 import logging
 import math
 import os
+import re
 import shutil
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,10 @@ _HF_WEIGHT_FILE_NAMES = {
     "flax_model.msgpack",
 }
 _HF_WEIGHT_FILE_SUFFIXES = (".safetensors", ".bin", ".pt", ".pth", ".ckpt", ".msgpack")
+_FUSED_EXPERT_WEIGHT_RE = re.compile(r"^(?P<prefix>.+\.mlp\.experts)\.(?P<projection>gate_up_proj|down_proj)$")
+_SPLIT_EXPERT_WEIGHT_RE = re.compile(
+    r"^(?P<prefix>.+\.mlp\.experts)\.(?P<expert>\d+)\." r"(?P<projection>gate_proj|up_proj|down_proj)\.weight$"
+)
 
 
 def save_hf_model_to_path(
@@ -348,10 +353,21 @@ def _copy_missing_weights_from_origin(
     from safetensors import safe_open
     from safetensors.torch import save_file
 
+    num_experts = _read_num_experts(origin)
     missing_by_shard: dict[str, list[str]] = {}
+    skipped_aliases = 0
     for name, shard in _origin_weight_locations(origin).items():
-        if name not in saved_weight_map:
-            missing_by_shard.setdefault(shard, []).append(name)
+        if name in saved_weight_map:
+            continue
+        if _expert_weight_is_covered_by_saved_alias(name, saved_weight_map, num_experts):
+            skipped_aliases += 1
+            continue
+        missing_by_shard.setdefault(shard, []).append(name)
+    if skipped_aliases:
+        logger.info(
+            "Skipping %d origin HF expert tensor(s) already represented by trained export aliases",
+            skipped_aliases,
+        )
     if not missing_by_shard:
         return []
 
@@ -383,6 +399,38 @@ def _copy_missing_weights_from_origin(
             }
         )
     return states
+
+
+def _read_num_experts(origin: Path) -> int | None:
+    config_path = origin / "config.json"
+    if not config_path.is_file():
+        return None
+    with open(config_path, encoding="utf-8") as f:
+        config = json.load(f)
+    value = config.get("text_config", {}).get("num_experts", config.get("num_experts"))
+    return int(value) if value is not None else None
+
+
+def _expert_weight_is_covered_by_saved_alias(
+    origin_name: str, saved_weight_map: dict[str, str], num_experts: int | None
+) -> bool:
+    fused_match = _FUSED_EXPERT_WEIGHT_RE.match(origin_name)
+    if fused_match:
+        if num_experts is None:
+            return False
+        prefix = fused_match.group("prefix")
+        projections = ("gate_proj", "up_proj") if fused_match.group("projection") == "gate_up_proj" else ("down_proj",)
+        return all(
+            f"{prefix}.{expert}.{projection}.weight" in saved_weight_map
+            for expert in range(num_experts)
+            for projection in projections
+        )
+
+    split_match = _SPLIT_EXPERT_WEIGHT_RE.match(origin_name)
+    if not split_match:
+        return False
+    fused_projection = "gate_up_proj" if split_match.group("projection") in ("gate_proj", "up_proj") else "down_proj"
+    return f"{split_match.group('prefix')}.{fused_projection}" in saved_weight_map
 
 
 def _finalize_shard_files(path: Path, shard_states: list[dict[str, Any] | None]) -> dict[str, Any]:

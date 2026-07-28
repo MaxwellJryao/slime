@@ -4,9 +4,10 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from safetensors.torch import load_file
+from safetensors.torch import load_file, save_file
 
 from slime.backends.megatron_utils.hf_checkpoint_saver import (
+    _copy_missing_weights_from_origin,
     _copy_hf_assets,
     _finalize_shard_files,
     _SafetensorShardWriter,
@@ -113,6 +114,54 @@ def test_pending_chunk_write_flushes_incomplete_node_group(tmp_path: Path):
 
     index = json.loads((tmp_path / "model.safetensors.index.json").read_text(encoding="utf-8"))
     assert index["weight_map"] == {f"layers.{i}.weight": f"model-{i + 1:05d}-of-00005.safetensors" for i in range(5)}
+
+
+def test_origin_fused_experts_are_not_copied_over_complete_trained_split_experts(tmp_path: Path):
+    origin = tmp_path / "origin"
+    output = tmp_path / "output"
+    origin.mkdir()
+    output.mkdir()
+    (origin / "config.json").write_text(json.dumps({"text_config": {"num_experts": 2}}), encoding="utf-8")
+
+    prefix = "model.language_model.layers.0.mlp.experts"
+    origin_weights = {
+        f"{prefix}.gate_up_proj": torch.ones(2, 4, 3),
+        f"{prefix}.down_proj": torch.ones(2, 3, 2),
+        "model.visual.weight": torch.ones(1),
+    }
+
+    save_file(origin_weights, origin / "model.safetensors")
+    saved_weight_map = {
+        f"{prefix}.{expert}.{projection}.weight": "model-trained.safetensors"
+        for expert in range(2)
+        for projection in ("gate_proj", "up_proj", "down_proj")
+    }
+
+    states = _copy_missing_weights_from_origin(output, origin, saved_weight_map)
+
+    assert len(states) == 1
+    assert states[0]["weight_map"] == {"model.visual.weight": "model-origin-00001.safetensors"}
+    assert set(load_file(output / "model-origin-00001.safetensors")) == {"model.visual.weight"}
+
+
+def test_origin_fused_expert_is_copied_when_trained_split_experts_are_incomplete(tmp_path: Path):
+    origin = tmp_path / "origin"
+    output = tmp_path / "output"
+    origin.mkdir()
+    output.mkdir()
+    (origin / "config.json").write_text(json.dumps({"text_config": {"num_experts": 2}}), encoding="utf-8")
+
+    name = "model.language_model.layers.0.mlp.experts.gate_up_proj"
+
+    save_file({name: torch.ones(2, 4, 3)}, origin / "model.safetensors")
+    saved_weight_map = {
+        "model.language_model.layers.0.mlp.experts.0.gate_proj.weight": "model-trained.safetensors",
+        "model.language_model.layers.0.mlp.experts.0.up_proj.weight": "model-trained.safetensors",
+    }
+
+    states = _copy_missing_weights_from_origin(output, origin, saved_weight_map)
+
+    assert states[0]["weight_map"] == {name: "model-origin-00001.safetensors"}
 
 
 if __name__ == "__main__":
