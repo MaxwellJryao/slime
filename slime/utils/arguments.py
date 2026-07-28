@@ -1483,6 +1483,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--polar-controller-max-action-scale",
+                type=float,
+                default=10.0,
+                help=(
+                    "Maximum per-turn advantage multiplier applied by "
+                    "'actual_action_balanced'. Set to 0 to disable the cap."
+                ),
+            )
+            parser.add_argument(
                 "--polar-gdpo-cost-gate-all-correct",
                 action="store_true",
                 help=(
