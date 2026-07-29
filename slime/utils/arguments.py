@@ -1502,6 +1502,46 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--polar-controller-cost-advantage-coef",
+                type=float,
+                default=0.0,
+                help=(
+                    "Coefficient for prompt-local controller turn cost-to-go "
+                    "advantages. 0 disables the feature and retains the configured "
+                    "trajectory-level reward objective."
+                ),
+            )
+            parser.add_argument(
+                "--polar-controller-cost-min-group-accuracy",
+                type=float,
+                default=0.0,
+                help=(
+                    "Minimum fraction of correct trajectories in a prompt group "
+                    "before controller turn cost advantages are enabled."
+                ),
+            )
+            parser.add_argument(
+                "--polar-controller-cost-to-go-gamma",
+                type=float,
+                default=1.0,
+                help="Discount factor for controller turn cost-to-go.",
+            )
+            parser.add_argument(
+                "--polar-controller-cost-to-go-horizon",
+                type=int,
+                default=1,
+                help="Maximum number of immediate controller action costs to sum.",
+            )
+            parser.add_argument(
+                "--polar-controller-cost-include-all-trajectories",
+                action="store_true",
+                help=(
+                    "Use every valid trajectory in an eligible prompt group's "
+                    "turn-cost normalization. By default only correct trajectories "
+                    "participate and receive cost advantages."
+                ),
+            )
+            parser.add_argument(
                 "--polar-drop-all-wrong-groups",
                 action="store_true",
                 help=(
