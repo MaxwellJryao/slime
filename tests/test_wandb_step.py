@@ -6,6 +6,8 @@ from slime.utils.metric_utils import set_wandb_step
 from slime.utils import logging_utils, wandb_utils
 from slime.utils.wandb_utils import (
     _DEFAULT_WANDB_FINISH_TIMEOUT_SECONDS,
+    _compute_config_for_logging,
+    _compute_secondary_config_for_logging,
     _init_wandb_common,
     _shared_writer_label,
     _wandb_run_name,
@@ -16,6 +18,16 @@ from slime.utils.wandb_utils import (
 
 NUM_GPUS = 0
 
+_CREDENTIAL_ARG_NAMES = (
+    "router_api_key",
+    "router_control_plane_api_keys",
+    "router_oracle_password",
+    "sglang_admin_api_key",
+    "sglang_api_key",
+    "sglang_ssl_keyfile_password",
+    "wandb_key",
+)
+
 
 def _args(*, always_use_train_step: bool) -> Namespace:
     return Namespace(
@@ -24,6 +36,34 @@ def _args(*, always_use_train_step: bool) -> Namespace:
         n_samples_per_prompt=8,
         global_batch_size=20,
     )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("credential_name", _CREDENTIAL_ARG_NAMES)
+def test_credential_arguments_are_excluded_from_all_wandb_writer_configs(
+    credential_name,
+):
+    args = Namespace(
+        use_critic=False,
+        input_key="prompt",
+        reward_key="reward",
+        max_tokens_per_gpu=8192,
+        **{credential_name: "credential-must-not-be-logged"},
+    )
+
+    configs = (
+        _compute_config_for_logging(args),
+        _compute_secondary_config_for_logging(args, role="actor"),
+        _compute_secondary_config_for_logging(args, role="critic"),
+    )
+
+    for config in configs:
+        assert "credential-must-not-be-logged" not in repr(config)
+        assert credential_name not in config
+        assert f"critic/{credential_name}" not in config
+    assert configs[0]["input_key"] == "prompt"
+    assert configs[0]["reward_key"] == "reward"
+    assert configs[0]["max_tokens_per_gpu"] == 8192
 
 
 @pytest.mark.unit

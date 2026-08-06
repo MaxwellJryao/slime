@@ -9,6 +9,17 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_WANDB_FINISH_TIMEOUT_SECONDS = 30.0
 _defined_metric_axes: set[tuple[str, str]] = set()
+_WANDB_CONFIG_SECRET_ARG_NAMES = frozenset(
+    {
+        "router_api_key",
+        "router_control_plane_api_keys",
+        "router_oracle_password",
+        "sglang_admin_api_key",
+        "sglang_api_key",
+        "sglang_ssl_keyfile_password",
+        "wandb_key",
+    }
+)
 
 
 def _wandb_run_name(args, *, group: str, generated_name: str) -> str:
@@ -174,7 +185,10 @@ def _compute_config_for_logging(args):
 
 
 def _args_to_config_dict(args):
-    return deepcopy(args.__dict__)
+    config = deepcopy(args.__dict__)
+    for name in _WANDB_CONFIG_SECRET_ARG_NAMES:
+        config.pop(name, None)
+    return config
 
 
 def _prefix_config_keys(config, prefix):
