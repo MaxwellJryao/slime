@@ -285,6 +285,7 @@ def log_rollout_data(
                 "tokens",
                 "multimodal_train_inputs",
                 "loss_masks",
+                "metadata",
                 "sample_indices",
                 "rollout_ids",
                 "rollout_mask_sums",

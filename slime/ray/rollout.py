@@ -1389,7 +1389,7 @@ class RolloutManager:
         if samples[0].rollout_routed_experts is not None:
             train_data["rollout_routed_experts"] = [sample.rollout_routed_experts for sample in samples]
 
-        if samples[0].train_metadata is not None:
+        if any(sample.train_metadata is not None for sample in samples):
             train_data["metadata"] = [sample.train_metadata for sample in samples]
 
         if any(sample.multimodal_train_inputs is not None for sample in samples):
@@ -1441,6 +1441,7 @@ class RolloutManager:
                 "truncated",
                 "loss_masks",
                 "round_number",
+                "metadata",
                 "sample_indices",
                 "rollout_ids",
                 "rollout_mask_sums",
