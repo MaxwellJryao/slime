@@ -1147,7 +1147,8 @@ def policy_loss_function(
     train_rollout_logprob_abs_diff = None
     if "rollout_log_probs" in batch and batch["rollout_log_probs"]:
         rollout_log_probs = torch.cat(batch["rollout_log_probs"], dim=0)
-        train_rollout_logprob_abs_diff = sum_of_sample_mean((old_log_probs - rollout_log_probs).abs())
+        train_log_probs = log_probs if args.use_rollout_logprobs else old_log_probs
+        train_rollout_logprob_abs_diff = sum_of_sample_mean((train_log_probs - rollout_log_probs).abs())
 
     reported_loss = {
         "loss": loss.clone().detach(),
