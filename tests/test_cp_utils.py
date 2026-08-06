@@ -23,6 +23,7 @@ import _cp_dist_helpers  # noqa: F401
 import pytest
 import torch
 
+from slime.backends.megatron_utils import cp_utils as cp_utils_module  # noqa: E402
 from slime.backends.megatron_utils.cp_utils import (  # noqa: E402
     get_logits_and_tokens_offset_with_cp,
     get_sum_of_sample_mean,
@@ -135,7 +136,11 @@ def test_cp_chunking_preserves_per_rollout_mean_report(monkeypatch):
     rank's reducer output across CP ranks reproduces the cp=1 result, which
     is what train_one_step then divides by ``step_global_batch_size``.
     """
-    from megatron.core import mpu as _mpu
+    # Patch the exact MPU object captured by the production module.  Another
+    # test may temporarily replace ``megatron.core.mpu`` in ``sys.modules``;
+    # importing it again here can therefore return a different object and
+    # leave the code under test unpatched.
+    _mpu = cp_utils_module.mpu
 
     # Use lengths that line up cleanly with the CP chunking
     # (chunk_size = ceil(total_length / (2*cp_size))).
