@@ -670,6 +670,14 @@ class MegatronTrainRayActor(TrainRayActor):
                 else:
                     self.weights_backuper.backup("old_actor")
 
+            if self.args.offload_train:
+                # ``torch_memory_saver.disable()`` owns a temporary CUDA
+                # MemPool that is disposed when this context exits. NCCL
+                # Work.wait() only establishes stream ordering, so weight
+                # broadcasts may still be using buffers from that pool.
+                # Fence while the pool is alive to prevent use-after-free.
+                torch.cuda.synchronize()
+
         if reconnect_rollout_engines:
             self.sleep()
         elif self.args.offload_train:
