@@ -17,6 +17,7 @@ from slime.ray.train_actor import TrainRayActor
 from slime.utils import train_dump_utils
 from slime.utils.data import process_rollout_data
 from slime.utils.distributed_utils import get_gloo_group
+from slime.utils.logging_utils import finish_tracking as finish_tracking_client
 from slime.utils.logging_utils import init_tracking
 from slime.utils.memory_utils import clear_memory, print_memory
 from slime.utils.misc import Box
@@ -60,6 +61,42 @@ def _pop_phase_timer_metrics(names: tuple[str, ...]) -> dict[str, float]:
 
 
 class MegatronTrainRayActor(TrainRayActor):
+    def _init_tracking_writer(self, args: Namespace, role: str) -> None:
+        """Attach the one W&B secondary owned by this trainer role.
+
+        The ownership bit is recorded while Megatron process groups are live.
+        Offloaded trainers may destroy those groups before shutdown, so the
+        matching finish RPC must not query model-parallel ranks again.
+        """
+
+        self._tracking_writer_initialized = False
+        if not is_megatron_main_rank():
+            return
+
+        init_tracking(args, primary=False, role=role)
+        self._tracking_writer_initialized = bool(
+            getattr(args, "use_wandb", False)
+            and getattr(args, "wandb_run_id", None) is not None
+        )
+
+    def finish_tracking(self) -> bool:
+        """Flush this rank's trainer-secondary writer exactly once.
+
+        RayTrainGroup invokes this method on every rank.  Only the rank that
+        initialized the role's W&B writer performs work; all other ranks
+        return immediately.  ``raise_on_error`` lets the driver observe a
+        failed RPC while still proceeding with the remaining shared writers.
+        """
+
+        if not getattr(self, "_tracking_writer_initialized", False):
+            return False
+
+        # Clear ownership before entering the SDK so a failed finish cannot be
+        # retried accidentally against a partially closed service process.
+        self._tracking_writer_initialized = False
+        finish_tracking_client(self.args, raise_on_error=True)
+        return True
+
     @with_defer(lambda: Timer().start("train_wait"))
     def init(
         self,
@@ -73,6 +110,7 @@ class MegatronTrainRayActor(TrainRayActor):
         # own marker; only the normal W&B logging rank publishes the duration.
         os.environ["SLIME_TRAINER_INIT_STARTED_UNIX_NS"] = str(time_ns())
         os.environ["SLIME_TRAINER_FIRST_STEP_PENDING"] = "1"
+        self._tracking_writer_initialized = False
         if args.debug_rollout_only:
             self.args = args
             return 0
@@ -82,8 +120,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
         init(args)
 
-        if is_megatron_main_rank():
-            init_tracking(args, primary=False, role=role)
+        self._init_tracking_writer(args, role)
 
         self.prof = TrainProfiler(args)
 

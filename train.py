@@ -1,9 +1,15 @@
+import logging
+
 import ray
 
 from slime.ray.placement_group import create_placement_groups, create_rollout_manager, create_training_models
+from slime.utils import logging_utils
 from slime.utils.arguments import parse_args
-from slime.utils.logging_utils import configure_logger, finish_tracking, init_tracking
+from slime.utils.logging_utils import configure_logger, init_tracking
 from slime.utils.misc import should_run_periodic_action
+
+
+logger = logging.getLogger(__name__)
 
 
 _SYNC_ASYNC_ONLY_ARGUMENTS = (
@@ -153,10 +159,32 @@ def train(args):
         if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch):
             ray.get(rollout_manager.eval.remote(rollout_id))
 
-    ray.get(rollout_manager.dispose.remote())
-    finish_tracking(args)
+    logging_utils.finish_distributed_tracking(
+        args,
+        actor_model,
+        critic_model,
+        finish_rollout_tracking=lambda: ray.get(
+            rollout_manager.dispose.remote()
+        ),
+    )
+
+
+def main():
+    args = parse_args()
+    try:
+        train(args)
+    except BaseException:
+        # Training may fail before the ordered normal shutdown is reached.
+        # Explicitly close the primary with a non-zero status so secondary
+        # service EOFs cannot leave the shared cloud run indefinitely running.
+        try:
+            logging_utils.finish_tracking(args, exit_code=1)
+        except BaseException:
+            # Teardown must never replace the original training exception or
+            # alter the process exit code selected by that exception.
+            logger.exception("Primary tracking teardown also failed")
+        raise
 
 
 if __name__ == "__main__":
-    args = parse_args()
-    train(args)
+    main()

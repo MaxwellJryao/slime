@@ -49,6 +49,9 @@ class _ActorModel:
     def clear_memory(self):
         self._events.append(("clear-memory", None))
 
+    def finish_tracking(self):
+        self._events.append(("trainer-finish", None))
+
 
 def _args() -> SimpleNamespace:
     return SimpleNamespace(
@@ -83,7 +86,13 @@ def _install_stubs(monkeypatch, events, *, fail_actor: bool = False):
         lambda _args, _pgs, _manager: (actor_model, None),
     )
     monkeypatch.setattr(train, "init_tracking", lambda _args: None)
-    monkeypatch.setattr(train, "finish_tracking", lambda _args: None)
+    monkeypatch.setattr(
+        train.logging_utils,
+        "finish_tracking",
+        lambda _args, *, raise_on_error=False, exit_code=None: events.append(
+            ("primary-finish", raise_on_error, exit_code)
+        ),
+    )
     monkeypatch.setattr(train, "should_run_periodic_action", lambda *_args, **_kwargs: False)
     monkeypatch.setattr(train.ray, "get", lambda value, **_kwargs: value)
     return rollout_manager
@@ -99,6 +108,9 @@ def test_sync_trainer_commits_rollout_metrics_after_actor_success(monkeypatch):
     assert names.index("generate") < names.index("train")
     assert names.index("train") < names.index("metrics-commit")
     assert names.index("metrics-commit") < names.index("dispose")
+    assert names.index("trainer-finish") < names.index("dispose")
+    assert names.index("dispose") < names.index("primary-finish")
+    assert ("primary-finish", False, 0) in events
     assert [event for event in events if event[0] == "weights"] == [
         ("weights", None),
         ("weights", 0),
@@ -150,6 +162,32 @@ def test_sync_trainer_rejects_async_only_lifecycle_arguments(name, value):
 
     with pytest.raises(ValueError, match=name):
         train.train(args)
+
+
+def test_sync_entrypoint_marks_primary_failed_without_masking_training_error(
+    monkeypatch,
+):
+    args = _args()
+    finishes = []
+    monkeypatch.setattr(train, "parse_args", lambda: args)
+    monkeypatch.setattr(
+        train,
+        "train",
+        lambda _args: (_ for _ in ()).throw(RuntimeError("provider failed")),
+    )
+    monkeypatch.setattr(
+        train.logging_utils,
+        "finish_tracking",
+        lambda observed_args, *, raise_on_error=False, exit_code=None: (
+            finishes.append((observed_args, raise_on_error, exit_code))
+            or (_ for _ in ()).throw(RuntimeError("tracking teardown failed"))
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="provider failed"):
+        train.main()
+
+    assert finishes == [(args, False, 1)]
 
 
 if __name__ == "__main__":

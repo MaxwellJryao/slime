@@ -31,24 +31,87 @@ def init_tracking(args, primary: bool = True, **kwargs):
         wandb_utils.init_wandb_secondary(args, **kwargs)
 
 
-def finish_tracking(args, *, raise_on_error: bool = False):
+def finish_tracking(
+    args,
+    *,
+    raise_on_error: bool = False,
+    exit_code: int | None = None,
+):
     """Finish the primary/secondary tracking client.
 
     Most shutdown paths keep the historical best-effort behavior.  A caller
     that is about to publish an external completion marker can opt into
     ``raise_on_error`` to propagate exceptions detected by the client.  W&B
     can report some transport failures only as warnings, so a successful
-    return is a flush attempt, not proof of server-side persistence.
+    return is a flush attempt, not proof of server-side persistence.  When
+    supplied, ``exit_code`` is forwarded to W&B's primary run-state update;
+    shared secondary writers are configured not to update that state.
     """
     if not args.use_wandb:
         return
     try:
         if wandb.run is not None:
-            wandb.finish()
+            wandb.finish(exit_code=exit_code)
     except Exception:
         logging.getLogger(__name__).exception("Failed to finish wandb run")
         if raise_on_error:
             raise
+
+
+def finish_distributed_tracking(
+    args,
+    actor_model,
+    critic_model,
+    *,
+    finish_rollout_tracking,
+    raise_on_primary_error: bool = False,
+):
+    """Close a shared W&B run in secondary-to-primary order.
+
+    Trainer failures are isolated so every remaining writer gets a close
+    attempt.  The rollout callback is kept between trainer secondaries and the
+    primary because RolloutManager owns its own secondary.  A rollout teardown
+    exception is re-raised after the primary close attempt and is not masked
+    by a simultaneous primary failure.
+    """
+
+    for role, model in (("actor", actor_model), ("critic", critic_model)):
+        if model is None:
+            continue
+        try:
+            model.finish_tracking()
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "Failed to finish %s trainer tracking; continuing shared-run shutdown",
+                role,
+            )
+
+    rollout_failure = None
+    try:
+        finish_rollout_tracking()
+    except Exception as exc:
+        rollout_failure = (exc, exc.__traceback__)
+
+    try:
+        finish_tracking(
+            args,
+            raise_on_error=raise_on_primary_error,
+            # A failure while disposing non-telemetry rollout state makes the
+            # process fail below, so the primary must not report a successful
+            # cloud terminal state first. Trainer telemetry failures are
+            # intentionally isolated above and retain exit code zero.
+            exit_code=1 if rollout_failure is not None else 0,
+        )
+    except Exception:
+        if rollout_failure is None:
+            raise
+        logging.getLogger(__name__).exception(
+            "Primary tracking finish also failed after rollout teardown failed"
+        )
+
+    if rollout_failure is not None:
+        exc, traceback = rollout_failure
+        raise exc.with_traceback(traceback)
 
 
 # TODO further refactor, e.g. put TensorBoard init to the "init" part

@@ -14,7 +14,7 @@ from slime.ray.placement_group import (
 from slime.ray.rollout import commit_rollout_metrics_from_journal
 from slime.utils import logging_utils
 from slime.utils.arguments import parse_args
-from slime.utils.logging_utils import configure_logger, finish_tracking, init_tracking
+from slime.utils.logging_utils import configure_logger, init_tracking
 from slime.utils.misc import should_run_periodic_action
 from slime.utils.startup_timing import (
     elapsed_seconds_from_env,
@@ -92,8 +92,9 @@ def _relay_final_eval_metrics_to_primary(args, metrics) -> None:
     RolloutManager keeps its secondary writer for backwards compatibility and
     for ordinary evals.  The final eval is also relayed to the driver so its
     critical row gets a second publication path before the durable final eval
-    marker is created.  ``wandb.finish`` may surface a transport timeout only
-    as a warning, so the marker also stores the payload for later recovery.
+    marker is created.  The primary stays open until ordered shutdown has
+    closed trainer and rollout-manager secondaries; the marker also stores the
+    payload for later recovery if W&B reports only a warning during teardown.
     """
 
     if not isinstance(metrics, dict):
@@ -111,10 +112,6 @@ def _relay_final_eval_metrics_to_primary(args, metrics) -> None:
             f"Final evaluation metric payload is missing its {step_key!r} axis"
         )
     logging_utils.log(args, metrics, step_key=step_key)
-    # W&B's primary process owns the run finish state. Propagate detectable
-    # failures before FINAL_EVAL_COMPLETE makes the evaluation skippable; a
-    # warning-only upload failure remains recoverable from the marker payload.
-    finish_tracking(args, raise_on_error=True)
 
 
 def _update_actor_weights_with_generation_barrier(
@@ -332,6 +329,7 @@ def train(args):
             eval_data_sha256=final_eval_data_sha256,
         )
     )
+    pending_final_eval_metrics = None
     if graceful_exit_deadline is not None:
         logger.info(
             "Graceful checkpoint deadline is Unix timestamp %.0f",
@@ -363,15 +361,7 @@ def train(args):
             )
         )
         _relay_final_eval_metrics_to_primary(args, final_eval_metrics)
-        write_final_eval_complete_marker(
-            final_eval_complete_marker,
-            final_rollout_id=final_rollout_id,
-            model_iteration=final_rollout_id,
-            num_rollout=args.num_rollout,
-            eval_data_sha256=final_eval_data_sha256,
-            metrics=final_eval_metrics,
-            primary_tracking_flush_attempted=bool(args.use_wandb),
-        )
+        pending_final_eval_metrics = final_eval_metrics
         final_eval_marker_valid = True
 
     # async train loop.
@@ -545,15 +535,7 @@ def train(args):
             )
             if require_final_eval_marker and rollout_id == final_rollout_id:
                 _relay_final_eval_metrics_to_primary(args, eval_metrics)
-                write_final_eval_complete_marker(
-                    final_eval_complete_marker,
-                    final_rollout_id=final_rollout_id,
-                    model_iteration=rollout_id,
-                    num_rollout=args.num_rollout,
-                    eval_data_sha256=final_eval_data_sha256,
-                    metrics=eval_metrics,
-                    primary_tracking_flush_attempted=bool(args.use_wandb),
-                )
+                pending_final_eval_metrics = eval_metrics
                 final_eval_marker_valid = True
 
     if completed_all_rollouts:
@@ -564,13 +546,48 @@ def train(args):
             raise RuntimeError(
                 "All rollouts are checkpointed, but the required final evaluation did not complete"
             )
+    logging_utils.finish_distributed_tracking(
+        args,
+        actor_model,
+        critic_model,
+        finish_rollout_tracking=lambda: _dispose_rollout_manager(
+            rollout_manager
+        ),
+        # Preserve the final-eval marker contract: detectable primary finish
+        # failures must surface before the recoverable marker is published.
+        raise_on_primary_error=pending_final_eval_metrics is not None,
+    )
+    if pending_final_eval_metrics is not None:
+        write_final_eval_complete_marker(
+            final_eval_complete_marker,
+            final_rollout_id=final_rollout_id,
+            model_iteration=final_rollout_id,
+            num_rollout=args.num_rollout,
+            eval_data_sha256=final_eval_data_sha256,
+            metrics=pending_final_eval_metrics,
+            primary_tracking_flush_attempted=bool(args.use_wandb),
+        )
+    if completed_all_rollouts:
         write_training_complete_marker(
             training_complete_marker, num_rollout=args.num_rollout
         )
-    _dispose_rollout_manager(rollout_manager)
-    finish_tracking(args)
+
+
+def main():
+    args = parse_args()
+    try:
+        train(args)
+    except BaseException:
+        # Preserve the original training exception/exit status while making
+        # the shared W&B primary terminal state unambiguously unsuccessful.
+        try:
+            logging_utils.finish_tracking(args, exit_code=1)
+        except BaseException:
+            # Never let a sidecar/service teardown error mask the failure that
+            # actually terminated training.
+            logger.exception("Primary tracking teardown also failed")
+        raise
 
 
 if __name__ == "__main__":
-    args = parse_args()
-    train(args)
+    main()
