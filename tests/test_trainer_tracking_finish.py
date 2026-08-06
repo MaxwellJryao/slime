@@ -2,11 +2,9 @@ from argparse import Namespace
 
 import pytest
 
-from _actor_import_helpers import install_actor_import_stubs
+from _actor_import_helpers import import_actor_module
 
-install_actor_import_stubs()
-
-from slime.backends.megatron_utils import actor as actor_module  # noqa: E402
+actor_module = import_actor_module()
 from slime.ray import actor_group as actor_group_module
 from slime.ray.actor_group import RayTrainGroup
 from slime.utils import logging_utils

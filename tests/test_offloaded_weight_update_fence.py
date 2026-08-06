@@ -5,9 +5,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from _actor_import_helpers import install_actor_import_stubs
+from _actor_import_helpers import import_actor_module
 
-install_actor_import_stubs()
+actor_module = import_actor_module()
 
 NUM_GPUS = 0
 
@@ -112,8 +112,6 @@ def _patch_runtime(monkeypatch, actor_module, events: list[str]) -> None:
 
 @pytest.mark.unit
 def test_offloaded_ppo_fences_temporary_pool_before_exit_and_sleep(monkeypatch) -> None:
-    from slime.backends.megatron_utils import actor as actor_module
-
     events: list[str] = []
     _patch_runtime(monkeypatch, actor_module, events)
     actor = _actor(
@@ -145,8 +143,6 @@ def test_offloaded_ppo_fences_temporary_pool_before_exit_and_sleep(monkeypatch) 
 
 @pytest.mark.unit
 def test_non_offloaded_weight_update_does_not_add_cuda_fence(monkeypatch) -> None:
-    from slime.backends.megatron_utils import actor as actor_module
-
     events: list[str] = []
     _patch_runtime(monkeypatch, actor_module, events)
     actor = _actor(actor_module, events, offload_train=False, use_critic=False)

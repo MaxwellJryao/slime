@@ -5,16 +5,15 @@ from types import SimpleNamespace
 
 import pytest
 
-from _actor_import_helpers import install_actor_import_stubs
+from _actor_import_helpers import import_actor_module
 
-install_actor_import_stubs()
+actor_module = import_actor_module()
 
 NUM_GPUS = 0
 
 
 @pytest.mark.unit
 def test_actor_captures_perf_context_before_offload_and_flushes_after(monkeypatch) -> None:
-    from slime.backends.megatron_utils import actor as actor_module
     from slime.backends.megatron_utils import data as data_module
 
     events: list[str] = []
