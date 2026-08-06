@@ -32,21 +32,13 @@ class _Unused:
 def install_actor_import_stubs() -> None:
     _stub_module("torch_memory_saver", torch_memory_saver=SimpleNamespace())
     _stub_module(
+        "megatron.core.packed_seq_params",
+        PackedSeqParams=_Unused,
+    )
+    _stub_module(
         "slime.backends.megatron_utils.checkpoint",
         is_release_checkpoint=_unused,
         load_checkpoint=_unused,
-    )
-    _stub_module(
-        "slime.backends.megatron_utils.cp_utils",
-        slice_log_prob_with_cp=_unused,
-        slice_with_cp=_unused,
-    )
-    _stub_module(
-        "slime.backends.megatron_utils.data",
-        DataIterator=_Unused,
-        get_data_iterator=_unused,
-        log_perf_data=_unused,
-        log_rollout_data=_unused,
     )
     _stub_module(
         "slime.backends.megatron_utils.hf_checkpoint_saver",
