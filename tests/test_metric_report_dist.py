@@ -296,6 +296,179 @@ def test_rollout_log_real_distributed_multi_key(dp_size, cp_size, tmp_path):
     assert reduced["rank_local_mean"] == pytest.approx(12.0)
 
 
+def _nonlinear_train_metrics_distributed_worker(
+    rank: int,
+    world_size: int,
+    cp_size: int,
+    dp_size: int,
+    master_port: int,
+    result_path: str,
+) -> None:
+    """All-reduce additive critic moments over genuine DP and CP shards."""
+
+    import pickle
+
+    import torch.distributed as _dist
+
+    cp_rank = rank % cp_size
+    dp_rank = rank // cp_size
+    stub_megatron_in_worker(cp_size, cp_rank)
+    dp_with_cp_group = init_worker_process_group(rank, world_size, master_port)
+    try:
+        from slime.backends.megatron_utils.cp_utils import (
+            masked_explained_variance_train_metric_stats,
+            masked_mean_train_metric_stats,
+            masked_root_mean_square_train_metric_stats,
+            reduce_train_step_metrics,
+        )
+
+        total_lengths = [12] * 4
+        response_lengths = [8] * 4
+        targets = [torch.arange(8, dtype=torch.float64) + 10.0 * index for index in range(4)]
+        residuals = [
+            torch.tensor([0.0, 1.0, -1.0, 2.0, -2.0, 3.0, -3.0, 4.0]),
+            torch.ones(8),
+            torch.tensor([-2.0, 2.0, -2.0, 2.0, -2.0, 2.0, -2.0, 2.0]),
+            torch.tensor([-4.0, -3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0]),
+        ]
+        predictions = [target + residual for target, residual in zip(targets, residuals, strict=True)]
+        masks = [torch.tensor([1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0])] * 4
+
+        my_indices = [index for index in range(4) if index % dp_size == dp_rank]
+        my_predictions = [predictions[index] for index in my_indices]
+        my_targets = [targets[index] for index in my_indices]
+        my_masks = [masks[index] for index in my_indices]
+        if cp_size > 1:
+            my_predictions = [
+                cp_chunk_response_tensor(
+                    value,
+                    total_lengths[index],
+                    response_lengths[index],
+                )
+                for index, value in zip(
+                    my_indices,
+                    my_predictions,
+                    strict=True,
+                )
+            ]
+            my_targets = [
+                cp_chunk_response_tensor(
+                    value,
+                    total_lengths[index],
+                    response_lengths[index],
+                )
+                for index, value in zip(my_indices, my_targets, strict=True)
+            ]
+            my_masks = [
+                cp_chunk_response_tensor(
+                    value,
+                    total_lengths[index],
+                    response_lengths[index],
+                )
+                for index, value in zip(my_indices, my_masks, strict=True)
+            ]
+
+        prediction = torch.cat(my_predictions)
+        target = torch.cat(my_targets)
+        loss_mask = torch.cat(my_masks)
+        residual = prediction - target
+        stats = {}
+        stats.update(
+            masked_mean_train_metric_stats(
+                "value_mae",
+                residual.abs(),
+                loss_mask,
+            )
+        )
+        stats.update(
+            masked_root_mean_square_train_metric_stats(
+                "value_rmse",
+                residual,
+                loss_mask,
+            )
+        )
+        stats.update(
+            masked_mean_train_metric_stats(
+                "value_residual_bias",
+                residual,
+                loss_mask,
+            )
+        )
+        stats.update(
+            masked_explained_variance_train_metric_stats(
+                "value_explained_variance",
+                predictions=prediction,
+                targets=target,
+                loss_mask=loss_mask,
+            )
+        )
+        values = torch.stack(
+            [torch.zeros((), dtype=torch.float64)] + [value.to(torch.float64).reshape(()) for value in stats.values()]
+        )
+        reduced = reduce_train_step_metrics(
+            [{"keys": list(stats), "values": values}],
+            calculate_per_token_loss=False,
+            step_global_batch_size=4,
+            cp_size=cp_size,
+            dp_with_cp_group=dp_with_cp_group,
+        )
+        if rank == 0:
+            with open(result_path, "wb") as handle:
+                pickle.dump(reduced, handle)
+    finally:
+        _dist.destroy_process_group()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("dp_size,cp_size", [(1, 1), (2, 1), (1, 2), (2, 2)])
+def test_nonlinear_train_metrics_real_distributed_dp_cp_invariance(
+    dp_size,
+    cp_size,
+    tmp_path,
+):
+    import pickle
+
+    import torch.multiprocessing as mp
+
+    targets = torch.cat([torch.arange(8, dtype=torch.float64) + 10.0 * index for index in range(4)])
+    residuals = torch.cat(
+        [
+            torch.tensor([0.0, 1.0, -1.0, 2.0, -2.0, 3.0, -3.0, 4.0]),
+            torch.ones(8),
+            torch.tensor([-2.0, 2.0, -2.0, 2.0, -2.0, 2.0, -2.0, 2.0]),
+            torch.tensor([-4.0, -3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0]),
+        ]
+    ).to(torch.float64)
+    mask = torch.tensor([1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0]).repeat(4).bool()
+    selected_targets = targets[mask]
+    selected_residuals = residuals[mask]
+    expected = {
+        "value_mae": selected_residuals.abs().mean().item(),
+        "value_rmse": selected_residuals.square().mean().sqrt().item(),
+        "value_residual_bias": selected_residuals.mean().item(),
+        "value_explained_variance": 1.0
+        - selected_residuals.var(unbiased=False).item() / selected_targets.var(unbiased=False).item(),
+    }
+
+    world_size = dp_size * cp_size
+    result_path = str(tmp_path / "nonlinear.pkl")
+    mp.spawn(
+        _nonlinear_train_metrics_distributed_worker,
+        args=(
+            world_size,
+            cp_size,
+            dp_size,
+            free_port(),
+            result_path,
+        ),
+        nprocs=world_size,
+        join=True,
+    )
+    with open(result_path, "rb") as handle:
+        reduced = pickle.load(handle)
+    assert reduced == pytest.approx(expected)
+
+
 # Keep an explicit reference to silence "unused import" complaints while
 # documenting that importing the helpers module is load-bearing (it
 # installs the megatron stub before slime is touched).
