@@ -1801,6 +1801,32 @@ def _apply_megatron_role_overrides(base_args, overrides, role):
                     pass
         setattr(role_args, key, value)
 
+    # Role YAML is applied after the main CLI validation. Validate these
+    # fields again so a scalar YAML string cannot be iterated character by
+    # character as a list of parameter-name patterns.
+    for field_name in (
+        "only_train_params_name_list",
+        "freeze_params_name_list",
+    ):
+        patterns = getattr(role_args, field_name, None)
+        if patterns is not None and (
+            not isinstance(patterns, list)
+            or not patterns
+            or any(not isinstance(pattern, str) or not pattern for pattern in patterns)
+        ):
+            raise ValueError(
+                f"{role} {field_name} must be a non-empty list of non-empty regex strings"
+            )
+
+    if getattr(role_args, "only_train_params_name_list", None) and getattr(
+        role_args,
+        "freeze_params_name_list",
+        None,
+    ):
+        raise ValueError(
+            f"{role} cannot set both only_train_params_name_list and freeze_params_name_list"
+        )
+
     if role == "critic":
         # Critic-specific: disable features that only apply to actors.
         role_args.kl_coef = 0

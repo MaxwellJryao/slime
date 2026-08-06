@@ -1,10 +1,27 @@
 """Unit tests for Megatron role config parsing and application."""
 
+import sys
 import tempfile
 from argparse import Namespace
+from types import ModuleType
 
 import pytest
 import yaml
+
+_sglang_arguments_stub = ModuleType("slime.backends.sglang_utils.arguments")
+_sglang_arguments_stub.sglang_parse_args = lambda: None
+_sglang_arguments_stub.validate_args = lambda _args: None
+sys.modules.setdefault(
+    "slime.backends.sglang_utils.arguments",
+    _sglang_arguments_stub,
+)
+
+from slime.utils.arguments import parse_megatron_role_args  # noqa: E402
+
+if sys.modules.get("slime.backends.sglang_utils.arguments") is _sglang_arguments_stub:
+    sys.modules.pop("slime.backends.sglang_utils.arguments")
+
+NUM_GPUS = 0
 
 
 def _write_yaml(data: dict) -> str:
@@ -30,6 +47,8 @@ def _base_args(**overrides):
         critic_num_gpus_per_node=1,
         use_critic=False,
         megatron_config_path=None,
+        only_train_params_name_list=None,
+        freeze_params_name_list=None,
         start_rollout_id=None,
         rollout_global_dataset=False,
     )
@@ -39,8 +58,6 @@ def _base_args(**overrides):
 
 class TestMegatronRoleConfig:
     def test_parse_actor_and_critic_role_overrides(self):
-        from slime.utils.arguments import parse_megatron_role_args
-
         path = _write_yaml(
             {
                 "megatron": [
@@ -71,8 +88,6 @@ class TestMegatronRoleConfig:
         assert critic_args.untie_embeddings_and_output_weights is True
 
     def test_missing_role_inherits_base_args(self):
-        from slime.utils.arguments import parse_megatron_role_args
-
         path = _write_yaml(
             {
                 "megatron": [
@@ -89,6 +104,75 @@ class TestMegatronRoleConfig:
         assert critic_args.kl_coef == 0
         assert critic_args.use_opd is False
 
+    def test_role_override_preserves_valid_parameter_pattern_list(self):
+        path = _write_yaml(
+            {
+                "megatron": [
+                    {
+                        "name": "default",
+                        "role": "critic",
+                        "overrides": {
+                            "freeze_params_name_list": [
+                                r"(?:^|\.)self_attention(?:\.|$)",
+                            ]
+                        },
+                    },
+                ]
+            }
+        )
+
+        critic_args = parse_megatron_role_args(_base_args(), path, role="critic")
+
+        assert critic_args.freeze_params_name_list == [
+            r"(?:^|\.)self_attention(?:\.|$)",
+        ]
+
+    @pytest.mark.parametrize(
+        "field_name",
+        ["only_train_params_name_list", "freeze_params_name_list"],
+    )
+    @pytest.mark.parametrize("invalid_value", ["attention", [], [""], [1]])
+    def test_role_override_rejects_invalid_parameter_pattern_lists(
+        self,
+        field_name,
+        invalid_value,
+    ):
+        path = _write_yaml(
+            {
+                "megatron": [
+                    {
+                        "name": "default",
+                        "role": "critic",
+                        "overrides": {field_name: invalid_value},
+                    },
+                ]
+            }
+        )
+
+        with pytest.raises(ValueError, match=f"critic {field_name} must be a non-empty list"):
+            parse_megatron_role_args(_base_args(), path, role="critic")
+
+    def test_role_override_rechecks_mutual_exclusion_after_yaml(self):
+        path = _write_yaml(
+            {
+                "megatron": [
+                    {
+                        "name": "default",
+                        "role": "critic",
+                        "overrides": {
+                            "freeze_params_name_list": [r"(?:^|\.)embedding(?:\.|$)"],
+                        },
+                    },
+                ]
+            }
+        )
+        args = _base_args(
+            only_train_params_name_list=[r"(?:^|\.)decoder(?:\.|$)"],
+        )
+
+        with pytest.raises(ValueError, match="cannot set both"):
+            parse_megatron_role_args(args, path, role="critic")
+
     @pytest.mark.parametrize(
         "config",
         [
@@ -98,8 +182,6 @@ class TestMegatronRoleConfig:
         ],
     )
     def test_requires_top_level_megatron_key(self, config):
-        from slime.utils.arguments import parse_megatron_role_args
-
         path = _write_yaml(config)
         args = _base_args()
 
@@ -156,3 +238,7 @@ class TestMegatronRoleConfig:
         assert actor_model.init_calls[0]["args"].lr == 1e-6
         assert actor_model.init_calls[0]["role"] == "actor"
         assert args.start_rollout_id == 7
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))
