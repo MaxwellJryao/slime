@@ -11,6 +11,7 @@ def test_controller_turn_cost_arguments_are_disabled_by_default() -> None:
     args = _parser().parse_args(["--rollout-batch-size", "1"])
 
     assert args.polar_controller_cost_advantage_coef == 0.0
+    assert args.polar_controller_cost_advantage_mode == "cost_to_go"
     assert args.polar_controller_cost_min_group_accuracy == 0.0
     assert args.polar_controller_cost_to_go_gamma == 1.0
     assert args.polar_controller_cost_to_go_horizon == 1
@@ -24,6 +25,8 @@ def test_controller_turn_cost_arguments_are_configurable() -> None:
             "1",
             "--polar-controller-cost-advantage-coef",
             "0.5",
+            "--polar-controller-cost-advantage-mode",
+            "trajectory_total",
             "--polar-controller-cost-min-group-accuracy",
             "0.25",
             "--polar-controller-cost-to-go-gamma",
@@ -35,6 +38,7 @@ def test_controller_turn_cost_arguments_are_configurable() -> None:
     )
 
     assert args.polar_controller_cost_advantage_coef == 0.5
+    assert args.polar_controller_cost_advantage_mode == "trajectory_total"
     assert args.polar_controller_cost_min_group_accuracy == 0.25
     assert args.polar_controller_cost_to_go_gamma == 0.9
     assert args.polar_controller_cost_to_go_horizon == 8

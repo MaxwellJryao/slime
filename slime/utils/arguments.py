@@ -1512,6 +1512,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--polar-controller-cost-advantage-mode",
+                choices=("cost_to_go", "trajectory_total"),
+                default="cost_to_go",
+                help=(
+                    "Assign controller cost credit using discounted per-turn "
+                    "cost-to-go or one total-cost advantage broadcast across "
+                    "the trajectory."
+                ),
+            )
+            parser.add_argument(
                 "--polar-controller-cost-min-group-accuracy",
                 type=float,
                 default=0.0,
