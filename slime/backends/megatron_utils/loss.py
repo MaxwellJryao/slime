@@ -1041,7 +1041,10 @@ def policy_loss_function(
 
     dppo_divergence = None
     if getattr(args, "policy_loss_type", "ppo") == "dppo":
-        response_mask = torch.cat(batch["loss_masks"], dim=0).bool()
+        response_mask = torch.cat(
+            [slice_log_prob_with_cp(mask, total_length, response_length) for mask, total_length, response_length in zip(batch["loss_masks"], total_lengths, response_lengths, strict=True)],
+            dim=0,
+        ).bool()
         pg_loss, pg_clipfrac, dppo_divergence = compute_dppo_loss(
             behavior_log_probs=old_log_probs,
             policy_log_probs=log_probs,
