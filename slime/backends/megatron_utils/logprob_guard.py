@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -12,6 +13,12 @@ from megatron.core import mpu
 from slime.utils.types import RolloutBatch
 
 from .cp_utils import slice_log_prob_with_cp
+
+
+@dataclass(frozen=True)
+class LogprobConsistencyMetrics:
+    mean_abs_diff: float
+    token_mult_prob_error: float
 
 
 def _collective_device(rollout_data: RolloutBatch) -> torch.device:
@@ -33,7 +40,7 @@ def enforce_train_rollout_logprob_abs_diff(
     rollout_data: RolloutBatch,
     *,
     rollout_id: int,
-) -> float | None:
+) -> LogprobConsistencyMetrics | None:
     """Abort all actor ranks when trainer/rollout log-probs are incompatible.
 
     The check intentionally runs after the trainer's whole-rollout log-prob
@@ -53,10 +60,10 @@ def enforce_train_rollout_logprob_abs_diff(
         return None
 
     device = _collective_device(rollout_data)
-    # [masked absolute-error sum, mask weight, malformed rank count,
-    #  non-finite token count]. Float64 keeps the aggregate stable for long
-    # agent traces and is supported by both NCCL and Gloo.
-    stats = torch.zeros(4, dtype=torch.float64, device=device)
+    # [masked absolute-error sum, masked exp(abs-error) sum, mask weight,
+    #  malformed rank count, non-finite token count]. Float64 keeps the
+    # aggregate stable for long agent traces and is supported by both NCCL and Gloo.
+    stats = torch.zeros(5, dtype=torch.float64, device=device)
     local_detail = ""
     # Per-sample (diff_sum, mask_sum) tensors, materialized only on failure so
     # the offending samples can be identified without a reproduction run.
@@ -71,10 +78,10 @@ def enforce_train_rollout_logprob_abs_diff(
 
         fields = (train_log_probs, rollout_log_probs, loss_masks, total_lengths, response_lengths)
         if any(value is None for value in fields):
-            stats[2] = 1
+            stats[3] = 1
             local_detail = "required log_probs/rollout_log_probs/loss_masks fields are missing"
         elif len({len(value) for value in fields}) != 1:
-            stats[2] = 1
+            stats[3] = 1
             local_detail = "trainer/rollout/mask sample counts differ"
         else:
             for sample_index, (train_lp, rollout_lp, loss_mask, total_length, response_length) in enumerate(
@@ -88,12 +95,12 @@ def enforce_train_rollout_logprob_abs_diff(
                 )
             ):
                 if not all(isinstance(value, torch.Tensor) for value in (train_lp, rollout_lp, loss_mask)):
-                    stats[2] = 1
+                    stats[3] = 1
                     local_detail = f"sample {sample_index} contains a non-tensor log-probability or mask"
                     break
                 local_mask = slice_log_prob_with_cp(loss_mask, total_length, response_length)
                 if train_lp.numel() != rollout_lp.numel() or train_lp.numel() != local_mask.numel():
-                    stats[2] = 1
+                    stats[3] = 1
                     local_detail = (
                         f"sample {sample_index} length mismatch: trainer={train_lp.numel()} "
                         f"rollout={rollout_lp.numel()} mask={local_mask.numel()}"
@@ -105,20 +112,22 @@ def enforce_train_rollout_logprob_abs_diff(
                 selected = mask > 0
                 if selected.any():
                     finite = torch.isfinite(diff)
-                    stats[3] += (selected & ~finite).sum().to(dtype=torch.float64, device=device)
+                    stats[4] += (selected & ~finite).sum().to(dtype=torch.float64, device=device)
                     safe_diff = torch.where(finite, diff, torch.zeros_like(diff))
                     sample_diff_sum = (safe_diff * mask).sum().to(dtype=torch.float64, device=device)
+                    sample_token_mult_sum = (torch.exp(safe_diff.to(torch.float64)) * mask.to(torch.float64)).sum()
                     sample_mask_sum = mask.sum().to(dtype=torch.float64, device=device)
                     stats[0] += sample_diff_sum
-                    stats[1] += sample_mask_sum
+                    stats[1] += sample_token_mult_sum
+                    stats[2] += sample_mask_sum
                     per_sample_stats.append((sample_index, sample_diff_sum, sample_mask_sum))
 
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(stats, op=dist.ReduceOp.SUM)
 
-    malformed_ranks = int(stats[2].item())
-    nonfinite_tokens = int(stats[3].item())
-    mask_weight = stats[1].item()
+    malformed_ranks = int(stats[3].item())
+    nonfinite_tokens = int(stats[4].item())
+    mask_weight = stats[2].item()
     if malformed_ranks or nonfinite_tokens or mask_weight <= 0:
         detail = f"; local detail: {local_detail}" if local_detail else ""
         raise RuntimeError(
@@ -137,7 +146,10 @@ def enforce_train_rollout_logprob_abs_diff(
             "response-token alignment. In fully-async training this also includes genuine policy lag; "
             "raise the explicit threshold only after verifying that lag is expected."
         )
-    return mean_abs_diff
+    return LogprobConsistencyMetrics(
+        mean_abs_diff=mean_abs_diff,
+        token_mult_prob_error=stats[1].item() / mask_weight,
+    )
 
 
 def _log_guard_failure_diagnostics(

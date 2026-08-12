@@ -389,7 +389,7 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.role == "critic":
             result = self.train_critic(rollout_id, rollout_data)
         else:
-            self.train_actor(rollout_id, rollout_data, external_data=external_data)
+            extra_metrics = self.train_actor(rollout_id, rollout_data, external_data=external_data)
             result = None
 
         if self.args.offload_train:
@@ -399,7 +399,7 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.role == "actor":
             # Flush only after the complete train call, including optional
             # wake/sleep offload phases, so nothing leaks into rollout N+1.
-            log_perf_data(rollout_id, self.args)
+            log_perf_data(rollout_id, self.args, extra_metrics=extra_metrics)
 
         return result
 
@@ -431,11 +431,12 @@ class MegatronTrainRayActor(TrainRayActor):
             return {"values": tensors_to_cpu(rollout_data["values"])}
         return {}
 
-    def train_actor(self, rollout_id: int, rollout_data: RolloutBatch, external_data=None) -> None:
+    def train_actor(self, rollout_id: int, rollout_data: RolloutBatch, external_data=None) -> dict[str, float]:
         # Create data iterator for log_probs and train.
         data_iterator = get_data_iterator(rollout_data)
         num_microbatches = rollout_data["num_microbatches"]
         global_batch_sizes = rollout_data["global_batch_sizes"]
+        extra_metrics: dict[str, float] = {}
 
         if self.args.use_rollout_routing_replay:
             self.fill_routing_replay(data_iterator, num_microbatches, rollout_data)
@@ -504,17 +505,19 @@ class MegatronTrainRayActor(TrainRayActor):
                     if self.args.use_rollout_routing_replay:
                         RoutingReplay.clear_all_forward()
 
-                logprob_abs_diff = enforce_train_rollout_logprob_abs_diff(
+                logprob_consistency = enforce_train_rollout_logprob_abs_diff(
                     self.args,
                     rollout_data,
                     rollout_id=rollout_id,
                 )
-                if logprob_abs_diff is not None and is_megatron_main_rank():
+                if logprob_consistency is not None and is_megatron_main_rank():
+                    extra_metrics["train/token_mult_prob_error"] = logprob_consistency.token_mult_prob_error
                     logger.info(
                         "trainer/rollout log-probability guard passed: rollout_id=%d "
-                        "masked_mean_abs_diff=%.6g threshold=%.6g",
+                        "masked_mean_abs_diff=%.6g token_mult_prob_error=%.6g threshold=%.6g",
                         rollout_id,
-                        logprob_abs_diff,
+                        logprob_consistency.mean_abs_diff,
+                        logprob_consistency.token_mult_prob_error,
                         self.args.max_train_rollout_logprob_abs_diff,
                     )
 
@@ -578,6 +581,7 @@ class MegatronTrainRayActor(TrainRayActor):
         # The outer train() flushes timers after optional offload sleep.
         # Weight-sync metrics are emitted separately by RayTrainGroup at the
         # exact rollout that produced the synchronized weights.
+        return extra_metrics
 
     def save_model(self, rollout_id: int, force_sync: bool = False) -> dict[str, float]:
         if self.args.debug_rollout_only:

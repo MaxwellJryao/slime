@@ -42,13 +42,17 @@ def test_logprob_guard_is_disabled_by_default():
 
 @pytest.mark.unit
 def test_logprob_guard_uses_true_masked_token_mean():
-    value = enforce_train_rollout_logprob_abs_diff(
+    metrics = enforce_train_rollout_logprob_abs_diff(
         _args(0.2),
         _rollout_data([-1.0, -2.0, -3.0], [-1.1, -2.2, -30.0], mask=[1, 1, 0]),
         rollout_id=4,
     )
 
-    assert value == pytest.approx(0.15, abs=1e-6)
+    assert metrics.mean_abs_diff == pytest.approx(0.15, abs=1e-6)
+    assert metrics.token_mult_prob_error == pytest.approx(
+        ((torch.exp(torch.tensor(0.1)) + torch.exp(torch.tensor(0.2))) / 2).item(),
+        abs=1e-6,
+    )
 
 
 @pytest.mark.unit
@@ -68,7 +72,7 @@ def test_logprob_guard_uses_one_global_decision_on_all_ranks(monkeypatch):
     def fake_all_reduce(stats, op=None):
         calls.append(op)
         # Local mean is 0.05 while a remote rank has a severe mismatch.
-        stats += torch.tensor([4.0, 2.0, 0.0, 0.0], dtype=stats.dtype)
+        stats += torch.tensor([4.0, 2.0, 2.0, 0.0, 0.0], dtype=stats.dtype)
 
     monkeypatch.setattr(dist, "is_initialized", lambda: True)
     monkeypatch.setattr(dist, "all_reduce", fake_all_reduce)
